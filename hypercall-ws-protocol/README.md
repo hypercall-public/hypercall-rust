@@ -1,5 +1,6 @@
 # hypercall-ws-protocol
 
+
 WebSocket and quote-provider protocol DTOs for Hypercall clients.
 
 ## Contents

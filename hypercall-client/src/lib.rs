@@ -22,37 +22,58 @@
 //!
 //! ## Crate Features
 //!
+pub mod account;
 pub mod api;
 pub mod error;
+pub mod perp;
 pub mod qp_client;
+pub mod qp_scoped;
 pub mod rfq;
 pub mod wallet;
 pub mod websocket;
 
+pub use account::{CreateAccountParams, CreateAccountResult};
 pub use api::{
     BulkOrderParams, BulkReplaceOrderParams, HypercallClient, OrderDecimalInput, OrderOptions,
     PlaceOrderParams, PublicLiquidationsQuery, ReplaceOrderParams, StandardMarginLiquidationParams,
 };
-pub use error::ClientError;
+pub use error::{ClientError, Result};
 pub use hypercall_sdk_types::ws_protocol::WsMessage;
 pub use hypercall_sdk_types::{CursorPage, LiquidationHistoryEntry, PublicLiquidationsResponse};
+pub use hypercall_ws_protocol::{
+    WsDeliveryClass, WsPressureCause, WsRecoveryAction, WsSlowConsumerCloseReason,
+};
+pub use perp::{
+    PerpCancelByCloidParams, PerpCancelByOidParams, PerpLimitOrderParams,
+    SetAccountAbstractionParams, UpdateApiWalletParams,
+};
 pub use qp_client::{
     NoopCallbacks, QpClientCallbacks, QpClientConfig, QpDisconnectReason, QpWriteFailure,
     QpWriteOperation,
 };
 pub use wallet::{
-    AccountAddress, AtomicNonceProvider, CancelOrderSignature, HypercallSigner, HypercallWallet,
-    NonceProvider, PlaceOrderSignature, ReplaceOrderSignature, StandardMarginLiquidationSignature,
+    AccountAddress, ApiWalletDirectiveSigner, AtomicNonceProvider, CancelOrderSignature,
+    HypercallSigner, HypercallWallet, ManagerDirectiveSigner, NonceProvider,
+    PerpCancelByCloidSignature, PerpCancelByOidSignature, PerpDirectiveSigner,
+    PerpLimitOrderSignature, PlaceOrderSignature, ReplaceOrderSignature,
+    SetAccountAbstractionSignature, StandardMarginLiquidationSignature, UpdateApiWalletSignature,
 };
-pub use websocket::WsClient;
+pub use websocket::{
+    WsClient, WsClientConfig, WsConnectionState, WsDisconnectReason, WsRecoveryPlan,
+};
 
 // Re-export commonly needed types from hypercall-sdk-types
 pub use hypercall_sdk_types::{
     AcceptRfqRequest, ApiResponse, BulkCancelOrderResponse, BulkPlaceOrderResponse,
-    CancelOrderRequest, ExchangeInfoResponse, Fill, HistoricalPnlInterval, HistoricalPnlPoint,
-    HistoricalPnlResponse, HistoricalTheoInterval, HistoricalTheoPoint, HistoricalTheoResponse,
-    InstrumentSpecResponse, MarginSummary, Market, OptionType, OrderInfo, OrderMessage,
-    OrderStatus, PlaceOrderRequest, PortfolioPosition, PortfolioResponse, RfqLegRequest, Side,
-    StandardMarginLiquidationOrderResponse, StandardMarginLiquidationPositionRequest,
-    SubmitRfqRequest, TimeInForce,
+    CancelOrderRequest, CanonicalOrdersResponse, DirectiveDeliveryStatus, DirectiveDomainStatus,
+    DirectiveStage, DirectiveStatusResponse, DirectiveSubmitRequest, DirectiveSubmitResponse,
+    ExchangeInfoResponse, Fill, FillApiResponse, FillsResponse, HcUpdateApiWalletAction,
+    HistoricalPnlInterval, HistoricalPnlPoint, HistoricalPnlResponse, HistoricalTheoInterval,
+    HistoricalTheoPoint, HistoricalTheoResponse, HlSetAbstractionAction,
+    HypercoreAccountAbstraction, InstrumentKind, InstrumentSpecResponse, MarginMode, MarginSummary,
+    Market, OptionType, Order, OrderInfo, OrderMessage, OrderStatus, OrdersApiResponse,
+    PerpCancelByCloidRequest, PerpCancelByOidRequest, PerpLimitOrderRequest, PerpTimeInForce,
+    PlaceOrderRequest, Portfolio, PortfolioPosition, PortfolioResponse, RfqLegRequest,
+    SetAccountAbstractionRequest, Side, SpanMarginSummary, StandardMarginLiquidationOrderResponse,
+    StandardMarginLiquidationPositionRequest, SubmitRfqRequest, TimeInForce,
 };

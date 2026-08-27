@@ -1,6 +1,119 @@
 //! Quote Provider WebSocket protocol for `/ws/quotes`.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+
+/// Capability string advertised in [`QpServerMessage::Authenticated`] when
+/// the server accepts [`QpClientMessage::ScopedIndicativeQuoteUpdate`].
+/// Clients must not send scoped updates without seeing this capability.
+pub const CAP_SCOPED_INDICATIVE: &str = "scoped_indicative";
+
+/// Opaque scope identifier for scoped indicative updates: exactly 16 bytes,
+/// contents client-defined. The server never interprets the contents; it
+/// only uses the id as a partition key for snapshot-omission eviction.
+///
+/// Wire form is a 32-character canonical lowercase hex JSON string. How a
+/// client derives the bytes is its own convention: a zero-padded ASCII
+/// label ([`ScopeId::from_label`]), raw UUID bytes (a UUID is already 128
+/// bits), or a stable 128-bit hash of a longer name. Collisions only
+/// matter within one wallet's scopes, so non-cryptographic derivations
+/// are fine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScopeId(pub [u8; 16]);
+
+impl ScopeId {
+    /// Canonical wire form: 32 lowercase hex characters.
+    pub fn to_hex(self) -> String {
+        let mut out = String::with_capacity(32);
+        for b in self.0 {
+            use std::fmt::Write;
+            write!(out, "{b:02x}").expect("writing hex to String cannot fail");
+        }
+        out
+    }
+
+    /// Convenience derivation: an ASCII label of at most 16 bytes,
+    /// zero-padded. Returns `None` for longer labels rather than
+    /// truncating, because truncation would silently collide distinct
+    /// scopes.
+    pub fn from_label(label: &str) -> Option<Self> {
+        let bytes = label.as_bytes();
+        if bytes.is_empty() || bytes.len() > 16 {
+            return None;
+        }
+        let mut buf = [0u8; 16];
+        buf[..bytes.len()].copy_from_slice(bytes);
+        Some(Self(buf))
+    }
+}
+
+impl std::fmt::Display for ScopeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
+
+impl TryFrom<&str> for ScopeId {
+    type Error = ScopeIdParseError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        let bytes = s.as_bytes();
+        if bytes.len() != 32 {
+            return Err(ScopeIdParseError::Length(bytes.len()));
+        }
+        let mut buf = [0u8; 16];
+        for (i, chunk) in bytes.chunks_exact(2).enumerate() {
+            let hi = hex_nibble(chunk[0]).ok_or(ScopeIdParseError::NotLowercaseHex)?;
+            let lo = hex_nibble(chunk[1]).ok_or(ScopeIdParseError::NotLowercaseHex)?;
+            buf[i] = (hi << 4) | lo;
+        }
+        Ok(Self(buf))
+    }
+}
+
+/// Canonical lowercase only: each scope has exactly one wire
+/// representation, so byte-level dedup/compare of frames stays valid.
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeIdParseError {
+    /// Wire scope must be exactly 32 hex characters (16 bytes).
+    Length(usize),
+    /// Wire scope must be canonical lowercase hex.
+    NotLowercaseHex,
+}
+
+impl std::fmt::Display for ScopeIdParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Length(n) => write!(f, "scope must be 32 lowercase hex chars, got length {n}"),
+            Self::NotLowercaseHex => f.write_str("scope must be canonical lowercase hex"),
+        }
+    }
+}
+
+impl std::error::Error for ScopeIdParseError {}
+
+impl Serialize for ScopeId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for ScopeId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Cow borrows when the deserializer can lend (in-memory JSON with
+        // no escapes, the hot server path) and owns otherwise (readers).
+        let s = std::borrow::Cow::<str>::deserialize(deserializer)?;
+        Self::try_from(s.as_ref()).map_err(serde::de::Error::custom)
+    }
+}
 
 /// Gateway-authenticated reconnect request for an already-authenticated QP.
 ///
@@ -34,8 +147,23 @@ pub enum QpClientMessage {
         nonce: u64,
         signature: String,
     },
-    /// Periodic indicative quote update.
+    /// Periodic indicative quote update: a full snapshot for the wallet.
+    /// Instruments this wallet previously quoted but omits here are
+    /// evicted server-side.
     IndicativeQuoteUpdate { quotes: Vec<IndicativeQuote> },
+    /// Scoped indicative quote update: a full snapshot of one
+    /// client-defined scope (see [`ScopeId`]). Eviction-by-omission is
+    /// limited to instruments this wallet previously published under the
+    /// same scope; other scopes are untouched. Empty `quotes` explicitly
+    /// clears the scope.
+    ///
+    /// Clients must only send this after the server advertised
+    /// [`CAP_SCOPED_INDICATIVE`] in [`QpServerMessage::Authenticated`];
+    /// older servers reject the unknown message type.
+    ScopedIndicativeQuoteUpdate {
+        scope: ScopeId,
+        quotes: Vec<IndicativeQuote>,
+    },
     /// Firm quote response to an RFQ.
     RfqResponse {
         rfq_id: String,
@@ -60,6 +188,13 @@ pub enum QpClientMessage {
 pub enum QpServerMessage {
     Authenticated {
         wallet: String,
+        /// Optional protocol capabilities this server supports (e.g.
+        /// [`CAP_SCOPED_INDICATIVE`]). Absent/empty on older servers, and
+        /// omitted from the wire when empty so a server advertising
+        /// nothing is byte-identical to a pre-capability server. Clients
+        /// must treat unknown strings as inert.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
     },
     AuthFailed {
         reason: String,
@@ -110,6 +245,58 @@ pub struct IndicativeQuote {
     pub max_ask_size: String,
 }
 
+/// Borrowing view of an indicative snapshot used by allocation-sensitive ingress.
+///
+/// Unescaped JSON strings point into the original WebSocket frame. Escaped strings
+/// fall back to an owned value so this remains wire-compatible with the ordinary
+/// [`QpClientMessage`] decoder.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+pub struct BorrowedIndicativeQuoteUpdate<'a> {
+    #[serde(rename = "type")]
+    _message_type: IndicativeQuoteUpdateType,
+    #[serde(borrow)]
+    pub quotes: Vec<BorrowedIndicativeQuote<'a>>,
+}
+
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IndicativeQuoteUpdateType {
+    IndicativeQuoteUpdate,
+}
+
+/// One quote whose string fields borrow from the snapshot frame when possible.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+pub struct BorrowedIndicativeQuote<'a> {
+    #[serde(borrow)]
+    pub instrument: Cow<'a, str>,
+    #[serde(borrow)]
+    pub bid_price: Cow<'a, str>,
+    #[serde(borrow)]
+    pub ask_price: Cow<'a, str>,
+    #[serde(borrow)]
+    pub max_bid_size: Cow<'a, str>,
+    #[serde(borrow)]
+    pub max_ask_size: Cow<'a, str>,
+}
+
+/// Borrowing view of a SCOPED indicative snapshot, the scoped counterpart
+/// of [`BorrowedIndicativeQuoteUpdate`]. Same borrowing rules; the scope
+/// id is fixed-size and always owned.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+pub struct BorrowedScopedIndicativeQuoteUpdate<'a> {
+    #[serde(rename = "type")]
+    _message_type: ScopedIndicativeQuoteUpdateType,
+    pub scope: ScopeId,
+    #[serde(borrow)]
+    pub quotes: Vec<BorrowedIndicativeQuote<'a>>,
+}
+
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ScopedIndicativeQuoteUpdateType {
+    ScopedIndicativeQuoteUpdate,
+}
+
 /// A leg in a QP's firm quote response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QpResponseLeg {
@@ -128,80 +315,5 @@ pub struct QpRfqLeg {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{QpClientMessage, QpRfqLeg, QpServerMessage};
-
-    #[test]
-    fn rfq_request_deserializes_without_auto_accept_limit() {
-        let json = r#"{"type":"rfq_request","rfq_id":"abc","legs":[],"taker_wallet":"0x123","request_timestamp":1,"response_deadline_ms":5000,"auto_execute":false}"#;
-        let msg: QpServerMessage = serde_json::from_str(json).unwrap();
-
-        match msg {
-            QpServerMessage::RfqRequest {
-                auto_accept_limit,
-                auto_execute,
-                taker_limit_price,
-                reference_price,
-                min_improvement_tick,
-                auction_deadline_ms,
-                requires_price_improvement,
-                ..
-            } => {
-                assert_eq!(auto_accept_limit, None);
-                assert!(!auto_execute);
-                assert_eq!(taker_limit_price, None);
-                assert_eq!(reference_price, None);
-                assert_eq!(min_improvement_tick, None);
-                assert_eq!(auction_deadline_ms, None);
-                assert!(!requires_price_improvement);
-            }
-            _ => panic!("expected rfq_request"),
-        }
-    }
-
-    #[test]
-    fn rfq_request_serializes_auto_accept_limit_when_present() {
-        let msg = QpServerMessage::RfqRequest {
-            rfq_id: "abc".to_string(),
-            legs: vec![QpRfqLeg {
-                instrument: "BTC-20260501-90000-C".to_string(),
-                side: "buy".to_string(),
-                size: "1".to_string(),
-            }],
-            taker_wallet: "0x123".to_string(),
-            request_timestamp: 1,
-            response_deadline_ms: 5000,
-            auto_accept_limit: Some("3999".to_string()),
-            auto_execute: true,
-            taker_limit_price: Some("3999".to_string()),
-            reference_price: Some("3999".to_string()),
-            min_improvement_tick: Some("0.0001".to_string()),
-            auction_deadline_ms: Some(2000),
-            requires_price_improvement: true,
-        };
-
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""auto_accept_limit":"3999""#));
-        assert!(json.contains(r#""auto_execute":true"#));
-        assert!(json.contains(r#""taker_limit_price":"3999""#));
-        assert!(json.contains(r#""reference_price":"3999""#));
-        assert!(json.contains(r#""min_improvement_tick":"0.0001""#));
-        assert!(json.contains(r#""auction_deadline_ms":2000"#));
-        assert!(json.contains(r#""requires_price_improvement":true"#));
-    }
-
-    #[test]
-    fn gateway_resume_has_distinct_wire_type() {
-        let msg = QpClientMessage::GatewayResumeQuoteProvider {
-            wallet: "0x123".to_string(),
-            timestamp: "42".to_string(),
-            nonce: 7,
-            signature: "0xsig".to_string(),
-        };
-
-        assert_eq!(
-            serde_json::to_string(&msg).unwrap(),
-            r#"{"type":"gateway_resume_quote_provider","wallet":"0x123","timestamp":"42","nonce":7,"signature":"0xsig"}"#
-        );
-    }
-}
+#[path = "qp_test.rs"]
+mod tests;

@@ -3,7 +3,7 @@
 use crate::{OrderRoute, Side, TimeInForce, WalletAddress};
 use serde::{Deserialize, Serialize};
 
-fn is_false(value: &bool) -> bool {
+pub(crate) fn is_false(value: &bool) -> bool {
     !*value
 }
 
@@ -27,6 +27,8 @@ pub struct PlaceOrderRequest {
     pub client_id: Option<String>,
     pub nonce: u64,
     pub signature: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reduce_only: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub mmp_enabled: bool,
     /// Optional builder code address for fee rebates
@@ -104,6 +106,15 @@ pub struct RevokeAgentRequest {
     pub signature: String,
 }
 
+/// Request to revoke every agent wallet authorized by the signer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokeAllAgentsRequest {
+    /// Nonce for replay protection
+    pub nonce: u64,
+    /// EIP-712 signature from wallet owner
+    pub signature: String,
+}
+
 /// Request to atomically cancel an existing order and place a new one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplaceOrderRequest {
@@ -125,6 +136,8 @@ pub struct ReplaceOrderRequest {
     pub client_id: Option<String>,
     pub nonce: u64,
     pub signature: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reduce_only: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub mmp_enabled: bool,
     /// Optional builder code address for fee rebates

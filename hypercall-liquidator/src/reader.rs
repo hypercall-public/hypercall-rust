@@ -53,6 +53,8 @@ mod tests {
             positions: Vec::new(),
             total_margin_used: dec!(300),
             available_balance: dec!(1000),
+            withdrawable_usdc: None,
+            portfolio_snapshot_timestamp_ms: None,
             margin_mode: "standard".to_string(),
             margin_summary: Some(MarginSummary {
                 mode: "standard".to_string(),
@@ -80,6 +82,8 @@ mod tests {
             positions: Vec::new(),
             total_margin_used: dec!(0),
             available_balance: dec!(0),
+            withdrawable_usdc: None,
+            portfolio_snapshot_timestamp_ms: None,
             margin_mode: "standard".to_string(),
             margin_summary: None,
         };

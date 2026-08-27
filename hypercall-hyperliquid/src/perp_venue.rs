@@ -1,43 +1,10 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::Tif;
 use hypercall_client::error::Result;
-use hypercall_client::ClientError;
 
 pub type PerpVenueFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tif {
-    Alo,
-    Gtc,
-    Ioc,
-}
-
-impl std::fmt::Display for Tif {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Tif::Alo => write!(f, "ALO"),
-            Tif::Gtc => write!(f, "GTC"),
-            Tif::Ioc => write!(f, "IOC"),
-        }
-    }
-}
-
-impl std::str::FromStr for Tif {
-    type Err = ClientError;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
-            "alo" => Ok(Tif::Alo),
-            "gtc" => Ok(Tif::Gtc),
-            "ioc" => Ok(Tif::Ioc),
-            _ => Err(ClientError::InvalidInput(format!(
-                "invalid tif '{}', expected: alo, gtc, ioc",
-                s
-            ))),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct PerpVenueOrderRequest {

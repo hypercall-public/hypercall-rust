@@ -50,8 +50,18 @@ use tracing::{error, info, warn};
 
 use crate::wallet::HypercallWallet;
 
-const INBOUND_CHANNEL_CLOSED: &str = "Inbound channel closed";
-const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const INBOUND_CHANNEL_CLOSED: &str = "Inbound channel closed";
+pub(crate) const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Write half of an established QP WebSocket.
+pub(crate) type WsSink = futures::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    Message,
+>;
+/// Read half of an established QP WebSocket.
+pub(crate) type WsStream = futures::stream::SplitStream<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+>;
 
 pub use hypercall_ws_protocol::{
     IndicativeQuote, QpClientMessage as ClientOutbound, QpResponseLeg as ResponseLeg,
@@ -149,6 +159,14 @@ impl QpClientCallbacks for NoopCallbacks {}
 pub struct QpClientConfig {
     pub api_url: String,
     pub reconnect_delay: Duration,
+    /// How often the scoped runtime ([`crate::qp_scoped`]) republishes
+    /// every live slot even without changes. The server TTL-evicts rows it
+    /// has not re-received within its TTL (60s in production), so this
+    /// must stay well inside that or quiet scopes silently vanish
+    /// server-side. `Duration::ZERO` disables the keepalive entirely.
+    /// Ignored by the legacy raw-channel client, whose callers send their
+    /// own periodic snapshots.
+    pub indicative_republish_interval: Duration,
 }
 
 impl QpClientConfig {
@@ -156,6 +174,7 @@ impl QpClientConfig {
         Self {
             api_url,
             reconnect_delay: Duration::from_secs(5),
+            indicative_republish_interval: Duration::from_secs(15),
         }
     }
 }
@@ -217,7 +236,7 @@ pub async fn run_qp_client(
     }
 }
 
-fn forward_inbound(
+pub(crate) fn forward_inbound_or_close(
     inbound_tx: &mpsc::Sender<ServerInbound>,
     msg: ServerInbound,
     callbacks: &dyn QpClientCallbacks,
@@ -236,13 +255,14 @@ fn forward_inbound(
     }
 }
 
-async fn connect_and_run(
+/// Connect, authenticate, and return the socket halves plus the server's
+/// advertised capabilities. Shared by the legacy raw-channel client and the
+/// scoped runtime in [`crate::qp_scoped`].
+pub(crate) async fn connect_and_auth(
     api_url: &str,
     wallet: &HypercallWallet,
-    outbound_rx: &mut mpsc::Receiver<ClientOutbound>,
-    inbound_tx: &mpsc::Sender<ServerInbound>,
     callbacks: &dyn QpClientCallbacks,
-) -> Result<(), String> {
+) -> Result<(WsSink, WsStream, Vec<String>), String> {
     let ws_url = if api_url.starts_with("https") {
         format!("{}/ws/quotes", api_url.replacen("https", "wss", 1))
     } else {
@@ -321,15 +341,32 @@ async fn connect_and_run(
 
     let server_msg: ServerInbound =
         serde_json::from_str(&auth_text).map_err(|e| format!("Auth parse: {e}"))?;
-    match &server_msg {
-        ServerInbound::Authenticated { wallet: w } => {
+    let capabilities = match server_msg {
+        ServerInbound::Authenticated {
+            wallet: w,
+            capabilities,
+        } => {
             info!("Authenticated as QP: {}", w);
+            capabilities
         }
         ServerInbound::AuthFailed { reason } => {
             return Err(format!("Authentication failed: {}", reason));
         }
-        _ => return Err(format!("Unexpected message during auth: {:?}", server_msg)),
-    }
+        other => return Err(format!("Unexpected message during auth: {:?}", other)),
+    };
+
+    Ok((ws_sender, ws_receiver, capabilities))
+}
+
+async fn connect_and_run(
+    api_url: &str,
+    wallet: &HypercallWallet,
+    outbound_rx: &mut mpsc::Receiver<ClientOutbound>,
+    inbound_tx: &mpsc::Sender<ServerInbound>,
+    callbacks: &dyn QpClientCallbacks,
+) -> Result<(), String> {
+    let (mut ws_sender, mut ws_receiver, _capabilities) =
+        connect_and_auth(api_url, wallet, callbacks).await?;
 
     // Message loop with heartbeat timeout
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
@@ -379,7 +416,7 @@ async fn connect_and_run(
                     Message::Text(text) => {
                         match serde_json::from_str::<ServerInbound>(&text) {
                             Ok(msg) => {
-                                forward_inbound(inbound_tx, msg, callbacks)?;
+                                forward_inbound_or_close(inbound_tx, msg, callbacks)?;
                             }
                             Err(e) => {
                                 warn!("Failed to parse server message: {}", e);
@@ -389,7 +426,7 @@ async fn connect_and_run(
                     Message::Binary(bytes) => {
                         if let Ok(text) = String::from_utf8(bytes.to_vec()) {
                             if let Ok(msg) = serde_json::from_str::<ServerInbound>(&text) {
-                                forward_inbound(inbound_tx, msg, callbacks)?;
+                                forward_inbound_or_close(inbound_tx, msg, callbacks)?;
                             }
                         }
                     }
@@ -458,6 +495,7 @@ mod tests {
 
             let authenticated = ServerInbound::Authenticated {
                 wallet: "0x0000000000000000000000000000000000000000".to_string(),
+                capabilities: Vec::new(),
             };
             ws.send(Message::Text(
                 serde_json::to_string(&authenticated).unwrap(),

@@ -13,17 +13,23 @@ include = ["Cargo.toml", "README.md", "src/**"]
 
 [features]
 default = []
+asyncapi = ["dep:asyncapi-rust", "schemars"]
+schemars = ["dep:schemars"]
 test-utils = []
+utoipa = ["dep:utoipa"]
 
 [dependencies]
 alloy = { version = "1.0", default-features = false }
+asyncapi-rust = { version = "0.2", optional = true }
 bitflags = "2"
 chrono = { version = "0.4", features = ["serde"] }
 rust_decimal = { version = "1.39", features = ["serde", "serde-with-str"] }
+schemars = { version = "1.2", features = ["chrono04", "derive", "rust_decimal1"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sonic-rs = "0.5"
 tracing = "0.1"
+utoipa = { version = "4", features = ["chrono"], optional = true }
 uuid = { version = "1", features = ["serde"] }
 
 [dev-dependencies]

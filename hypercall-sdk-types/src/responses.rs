@@ -495,100 +495,6 @@ pub struct Pagination {
     pub count: usize,
 }
 
-/// Competition leaderboard row.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompetitionLeaderboardRow {
-    pub rank: usize,
-    pub wallet: WalletAddress,
-    pub username: String,
-    #[serde(deserialize_with = "string_decimal")]
-    pub pnl: Decimal,
-    #[serde(deserialize_with = "string_decimal")]
-    pub volume: Decimal,
-    #[serde(deserialize_with = "string_decimal")]
-    pub efficiency: Decimal,
-    pub medal: Option<u8>,
-}
-
-/// Connected wallet summary on a competition leaderboard response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompetitionConnectedUserRank {
-    pub wallet: WalletAddress,
-    pub username: String,
-    pub rank: Option<usize>,
-    #[serde(default, deserialize_with = "option_string_decimal")]
-    pub pnl: Option<Decimal>,
-    #[serde(default, deserialize_with = "option_string_decimal")]
-    pub volume: Option<Decimal>,
-    #[serde(default, deserialize_with = "option_string_decimal")]
-    pub efficiency: Option<Decimal>,
-    pub medal: Option<u8>,
-}
-
-/// Competition leaderboard response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompetitionLeaderboardResponse {
-    pub success: bool,
-    pub competition_id: i64,
-    pub sort_by: String,
-    pub sort_order: String,
-    #[serde(default)]
-    pub data: Vec<CompetitionLeaderboardRow>,
-    #[serde(default)]
-    pub connected_user: Option<CompetitionConnectedUserRank>,
-    pub pagination: Pagination,
-}
-
-/// Competition PnL standing for a single wallet.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompetitionPnlStanding {
-    pub competition_id: i64,
-    pub competition_name: String,
-    pub competition_state: String,
-    pub rank: Option<usize>,
-    #[serde(deserialize_with = "string_decimal")]
-    pub pnl: Decimal,
-    #[serde(deserialize_with = "string_decimal")]
-    pub volume: Decimal,
-    #[serde(deserialize_with = "string_decimal")]
-    pub efficiency: Decimal,
-    pub medal: Option<u8>,
-}
-
-/// Competition PnL summary for a wallet.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompetitionPnlSummary {
-    pub wallet: WalletAddress,
-    #[serde(deserialize_with = "string_decimal")]
-    pub lifetime_realized_pnl: Decimal,
-    #[serde(default)]
-    pub active_competition: Option<CompetitionPnlStanding>,
-}
-
-/// Competition summary response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompetitionPnlSummaryResponse {
-    pub success: bool,
-    pub data: CompetitionPnlSummary,
-}
-
-/// Competition account PnL response payload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompetitionAccountPnl {
-    pub wallet: WalletAddress,
-    pub username: String,
-    #[serde(deserialize_with = "string_decimal")]
-    pub lifetime_realized_pnl: Decimal,
-    pub competition: CompetitionPnlStanding,
-}
-
-/// Competition account response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompetitionAccountResponse {
-    pub success: bool,
-    pub data: CompetitionAccountPnl,
-}
-
 /// Orders list response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrdersResponse {
@@ -662,6 +568,15 @@ pub struct ApproveAgentResponse {
 /// Response for revoking an agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevokeAgentResponse {
+    /// Whether the request succeeded
+    pub success: bool,
+    /// Error message if failed
+    pub error: Option<String>,
+}
+
+/// Response for revoking every agent authorized by a wallet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokeAllAgentsResponse {
     /// Whether the request succeeded
     pub success: bool,
     /// Error message if failed
@@ -1065,23 +980,29 @@ pub struct HistoricalTheoResponse {
 
 /// Unified margin summary that works for both Standard and Portfolio modes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct MarginSummary {
     /// Margin mode: "standard" or "portfolio"
     pub mode: String,
     /// Total account equity (balance + unrealized PnL)
     #[serde(deserialize_with = "string_decimal")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub equity: Decimal,
     /// Initial Margin required from positions
     #[serde(deserialize_with = "string_decimal")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub position_im: Decimal,
     /// Initial Margin from open orders
     #[serde(deserialize_with = "string_decimal")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub open_orders_im: Decimal,
     /// Excess Initial Margin (equity - position_im - open_orders_im)
     #[serde(deserialize_with = "string_decimal")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub initial_margin: Decimal,
     /// Excess Maintenance Margin (equity - position_mm)
     #[serde(deserialize_with = "string_decimal")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub maintenance_margin: Decimal,
     /// (Standard mode only) USDC premium reserved for open BUY orders
     #[serde(
@@ -1089,6 +1010,7 @@ pub struct MarginSummary {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "option_string_decimal"
     )]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub open_orders_premium_reserved: Option<Decimal>,
 }
 
@@ -1161,6 +1083,12 @@ pub struct PortfolioResponse {
     /// Available balance for new positions
     #[serde(deserialize_with = "string_decimal")]
     pub available_balance: Decimal,
+    /// Account.sol USDC currently eligible for a direct PM withdrawal.
+    #[serde(default, deserialize_with = "option_string_decimal")]
+    pub withdrawable_usdc: Option<Decimal>,
+    /// Source timestamp of the authoritative Hydromancer portfolio snapshot.
+    #[serde(default)]
+    pub portfolio_snapshot_timestamp_ms: Option<u64>,
     /// Margin mode: "standard" or "portfolio"
     #[serde(default = "default_margin_mode")]
     pub margin_mode: String,

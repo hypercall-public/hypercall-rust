@@ -7,4 +7,3 @@ members = [
     "hypercall-hyperliquid",
     "hypercall-liquidator",
 ]
-

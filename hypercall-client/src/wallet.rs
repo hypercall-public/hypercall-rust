@@ -31,6 +31,7 @@
 //!     tif: "ioc",
 //!     route: hypercall_sdk_types::OrderRoute::BestExecution,
 //!     client_id: "order_1",
+//!     reduce_only: false,
 //!     nonce: wallet.next_nonce(),
 //! }).await?;
 //! # Ok(())
@@ -55,7 +56,10 @@ use alloy::{
     sol,
     sol_types::{Eip712Domain, SolStruct},
 };
-use hypercall_sdk_types::{OrderRoute, WalletAddress};
+use hypercall_sdk_types::{
+    HcUpdateApiWalletAction, HlCancelByCloidAction, HlCancelByOidAction, HlLimitOrderAction,
+    HlSetAbstractionAction, OrderRoute, WalletAddress,
+};
 
 use crate::error::{ClientError, Result};
 
@@ -153,10 +157,94 @@ sol! {
     }
 
     #[derive(Debug, PartialEq, Eq)]
+    struct PlaceOrderReduceOnly {
+        address wallet;
+        string symbol;
+        string side;
+        string size;
+        string price;
+        string tif;
+        string route;
+        string clientId;
+        bool reduceOnly;
+        uint64 nonce;
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
     struct CancelOrder {
         address wallet;
         string orderId;
         uint64 nonce;
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct LimitOrder {
+        uint32 asset;
+        bool isBuy;
+        uint64 limitPx;
+        uint64 sz;
+        bool reduceOnly;
+        uint8 encodedTif;
+        uint128 cloid;
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct CancelOrderByOid {
+        uint32 asset;
+        uint64 oid;
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct CancelOrderByCloid {
+        uint32 asset;
+        uint128 cloid;
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct HLOrder {
+        address account;
+        uint64 nonce;
+        LimitOrder action;
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct HLCancel {
+        address account;
+        uint64 nonce;
+        CancelOrderByOid action;
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct HLCancelByCloid {
+        address account;
+        uint64 nonce;
+        CancelOrderByCloid action;
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct SetAbstraction {
+        address user;
+        uint8 abstraction;
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct HLSetAbstraction {
+        address account;
+        uint64 nonce;
+        SetAbstraction action;
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct UpdateApiWallet {
+        bytes32 name;
+        address addr;
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct HCUpdateApiWallet {
+        address account;
+        uint64 nonce;
+        UpdateApiWallet action;
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -223,6 +311,20 @@ sol! {
     }
 
     #[derive(Debug, PartialEq, Eq)]
+    struct ReplaceOrderReduceOnly {
+        address wallet;
+        string orderId;
+        string symbol;
+        string side;
+        string size;
+        string price;
+        string tif;
+        string clientId;
+        bool reduceOnly;
+        uint64 nonce;
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
     struct StandardMarginLiquidationOrder {
         address wallet;
         address liquidatedWallet;
@@ -279,6 +381,14 @@ impl SignerBackend {
         }
     }
 
+    fn ethereum_wallet(&self) -> alloy::network::EthereumWallet {
+        match self {
+            SignerBackend::Local(signer) => alloy::network::EthereumWallet::from(signer.clone()),
+            #[cfg(feature = "kms")]
+            SignerBackend::AwsKms(signer) => alloy::network::EthereumWallet::from(signer.clone()),
+        }
+    }
+
     async fn sign_typed_data<T: SolStruct + Send + Sync>(
         &self,
         message: &T,
@@ -324,6 +434,7 @@ pub struct PlaceOrderSignature<'a> {
     pub tif: &'a str,
     pub route: OrderRoute,
     pub client_id: &'a str,
+    pub reduce_only: bool,
     pub nonce: u64,
 }
 
@@ -344,6 +455,7 @@ pub struct ReplaceOrderSignature<'a> {
     pub price: &'a str,
     pub tif: &'a str,
     pub client_id: &'a str,
+    pub reduce_only: bool,
     pub nonce: u64,
 }
 
@@ -361,6 +473,41 @@ pub struct StandardMarginLiquidationSignature<'a> {
     pub nonce: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PerpLimitOrderSignature {
+    pub account: AccountAddress,
+    pub nonce: u64,
+    pub action: HlLimitOrderAction,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PerpCancelByOidSignature {
+    pub account: AccountAddress,
+    pub nonce: u64,
+    pub action: HlCancelByOidAction,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PerpCancelByCloidSignature {
+    pub account: AccountAddress,
+    pub nonce: u64,
+    pub action: HlCancelByCloidAction,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SetAccountAbstractionSignature {
+    pub account: AccountAddress,
+    pub nonce: u64,
+    pub action: HlSetAbstractionAction,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct UpdateApiWalletSignature {
+    pub account: AccountAddress,
+    pub nonce: u64,
+    pub action: HcUpdateApiWalletAction,
+}
+
 #[allow(async_fn_in_trait)]
 pub trait HypercallSigner {
     fn address(&self) -> AccountAddress;
@@ -375,6 +522,38 @@ pub trait HypercallSigner {
     async fn sign_standard_margin_liquidation_payload(
         &self,
         payload: StandardMarginLiquidationSignature<'_>,
+    ) -> Result<String>;
+}
+
+#[allow(async_fn_in_trait)]
+pub trait PerpDirectiveSigner: HypercallSigner {
+    async fn sign_perp_limit_order_payload(
+        &self,
+        payload: PerpLimitOrderSignature,
+    ) -> Result<String>;
+    async fn sign_perp_cancel_by_oid_payload(
+        &self,
+        payload: PerpCancelByOidSignature,
+    ) -> Result<String>;
+    async fn sign_perp_cancel_by_cloid_payload(
+        &self,
+        payload: PerpCancelByCloidSignature,
+    ) -> Result<String>;
+}
+
+#[allow(async_fn_in_trait)]
+pub trait ManagerDirectiveSigner: HypercallSigner {
+    async fn sign_set_account_abstraction_payload(
+        &self,
+        payload: SetAccountAbstractionSignature,
+    ) -> Result<String>;
+}
+
+#[allow(async_fn_in_trait)]
+pub trait ApiWalletDirectiveSigner: HypercallSigner {
+    async fn sign_update_api_wallet_payload(
+        &self,
+        payload: UpdateApiWalletSignature,
     ) -> Result<String>;
 }
 
@@ -461,7 +640,56 @@ impl HypercallSigner for HypercallWallet {
     }
 }
 
+impl PerpDirectiveSigner for HypercallWallet {
+    async fn sign_perp_limit_order_payload(
+        &self,
+        payload: PerpLimitOrderSignature,
+    ) -> Result<String> {
+        HypercallWallet::sign_perp_limit_order_payload(self, payload).await
+    }
+
+    async fn sign_perp_cancel_by_oid_payload(
+        &self,
+        payload: PerpCancelByOidSignature,
+    ) -> Result<String> {
+        HypercallWallet::sign_perp_cancel_by_oid_payload(self, payload).await
+    }
+
+    async fn sign_perp_cancel_by_cloid_payload(
+        &self,
+        payload: PerpCancelByCloidSignature,
+    ) -> Result<String> {
+        HypercallWallet::sign_perp_cancel_by_cloid_payload(self, payload).await
+    }
+}
+
+impl ManagerDirectiveSigner for HypercallWallet {
+    async fn sign_set_account_abstraction_payload(
+        &self,
+        payload: SetAccountAbstractionSignature,
+    ) -> Result<String> {
+        HypercallWallet::sign_set_account_abstraction_payload(self, payload).await
+    }
+}
+
+impl ApiWalletDirectiveSigner for HypercallWallet {
+    async fn sign_update_api_wallet_payload(
+        &self,
+        payload: UpdateApiWalletSignature,
+    ) -> Result<String> {
+        HypercallWallet::sign_update_api_wallet_payload(self, payload).await
+    }
+}
+
 impl HypercallWallet {
+    pub(crate) fn ethereum_wallet(&self) -> alloy::network::EthereumWallet {
+        self.signer.ethereum_wallet()
+    }
+
+    pub(crate) fn chain_id(&self) -> u64 {
+        u64::from(self.chain_id)
+    }
+
     /// Create a new wallet from a private key.
     ///
     /// # Arguments
@@ -586,29 +814,163 @@ impl HypercallWallet {
         hypercall_domain(self.chain_id)
     }
 
+    fn directive_domain(&self, name: &'static str) -> Result<Eip712Domain> {
+        if !matches!(self.chain_id, 998 | 999) {
+            return Err(ClientError::InvalidInput(format!(
+                "unsupported directive chain id: {}",
+                self.chain_id
+            )));
+        }
+        Ok(Eip712Domain {
+            name: Some(name.into()),
+            version: Some("1".into()),
+            chain_id: Some(alloy::primitives::U256::from(self.chain_id)),
+            verifying_contract: Some(alloy::primitives::Address::ZERO),
+            salt: None,
+        })
+    }
+
+    pub async fn sign_perp_limit_order_payload(
+        &self,
+        payload: PerpLimitOrderSignature,
+    ) -> Result<String> {
+        let action = payload.action;
+        let message = HLOrder {
+            account: payload.account.as_wallet_address().inner(),
+            nonce: payload.nonce,
+            action: LimitOrder {
+                asset: action.asset,
+                isBuy: action.is_buy,
+                limitPx: action.limit_px,
+                sz: action.sz,
+                reduceOnly: action.reduce_only,
+                encodedTif: action.tif.encoded(),
+                cloid: action.cloid,
+            },
+        };
+        self.sign_directive(&message, "HLOrder", "HypercallApiSign")
+            .await
+    }
+
+    pub async fn sign_perp_cancel_by_oid_payload(
+        &self,
+        payload: PerpCancelByOidSignature,
+    ) -> Result<String> {
+        let message = HLCancel {
+            account: payload.account.as_wallet_address().inner(),
+            nonce: payload.nonce,
+            action: CancelOrderByOid {
+                asset: payload.action.asset,
+                oid: payload.action.oid,
+            },
+        };
+        self.sign_directive(&message, "HLCancel", "HypercallApiSign")
+            .await
+    }
+
+    pub async fn sign_perp_cancel_by_cloid_payload(
+        &self,
+        payload: PerpCancelByCloidSignature,
+    ) -> Result<String> {
+        let message = HLCancelByCloid {
+            account: payload.account.as_wallet_address().inner(),
+            nonce: payload.nonce,
+            action: CancelOrderByCloid {
+                asset: payload.action.asset,
+                cloid: payload.action.cloid,
+            },
+        };
+        self.sign_directive(&message, "HLCancelByCloid", "HypercallApiSign")
+            .await
+    }
+
+    pub async fn sign_set_account_abstraction_payload(
+        &self,
+        payload: SetAccountAbstractionSignature,
+    ) -> Result<String> {
+        let message = HLSetAbstraction {
+            account: payload.account.as_wallet_address().inner(),
+            nonce: payload.nonce,
+            action: SetAbstraction {
+                user: payload.action.user.inner(),
+                abstraction: payload.action.abstraction.as_u8(),
+            },
+        };
+        self.sign_directive(&message, "HLSetAbstraction", "HypercallManagerSign")
+            .await
+    }
+
+    pub async fn sign_update_api_wallet_payload(
+        &self,
+        payload: UpdateApiWalletSignature,
+    ) -> Result<String> {
+        let message = HCUpdateApiWallet {
+            account: payload.account.as_wallet_address().inner(),
+            nonce: payload.nonce,
+            action: UpdateApiWallet {
+                name: payload.action.name,
+                addr: payload.action.addr.inner(),
+            },
+        };
+        self.sign_directive(&message, "HCUpdateApiWallet", "HypercallManagerSign")
+            .await
+    }
+
+    async fn sign_directive<T>(
+        &self,
+        message: &T,
+        type_name: &str,
+        domain_name: &'static str,
+    ) -> Result<String>
+    where
+        T: SolStruct + Send + Sync,
+    {
+        let domain = self.directive_domain(domain_name)?;
+        let signature = self
+            .signer
+            .sign_typed_data(message, &domain)
+            .await
+            .map_err(|error| {
+                ClientError::Signing(format!("Failed to sign {type_name}: {error}"))
+            })?;
+        Ok(format!("{signature}"))
+    }
+
     /// Sign a PlaceOrder action.
     pub async fn sign_place_order_payload(
         &self,
         payload: PlaceOrderSignature<'_>,
     ) -> Result<String> {
-        let message = PlaceOrder {
-            wallet: payload.wallet.as_wallet_address().inner(),
-            symbol: payload.symbol.to_string(),
-            side: payload.side.to_string(),
-            size: payload.size.to_string(),
-            price: payload.price.to_string(),
-            tif: payload.tif.to_string(),
-            route: payload.route.as_signed_str().to_string(),
-            clientId: payload.client_id.to_string(),
-            nonce: payload.nonce,
-        };
-
         let domain = self.hypercall_domain();
-        let signature = self
-            .signer
-            .sign_typed_data(&message, &domain)
-            .await
-            .map_err(|e| ClientError::Signing(format!("Failed to sign PlaceOrder: {}", e)))?;
+        let signature = if payload.reduce_only {
+            let message = PlaceOrderReduceOnly {
+                wallet: payload.wallet.as_wallet_address().inner(),
+                symbol: payload.symbol.to_string(),
+                side: payload.side.to_string(),
+                size: payload.size.to_string(),
+                price: payload.price.to_string(),
+                tif: payload.tif.to_string(),
+                route: payload.route.as_signed_str().to_string(),
+                clientId: payload.client_id.to_string(),
+                reduceOnly: true,
+                nonce: payload.nonce,
+            };
+            self.signer.sign_typed_data(&message, &domain).await
+        } else {
+            let message = PlaceOrder {
+                wallet: payload.wallet.as_wallet_address().inner(),
+                symbol: payload.symbol.to_string(),
+                side: payload.side.to_string(),
+                size: payload.size.to_string(),
+                price: payload.price.to_string(),
+                tif: payload.tif.to_string(),
+                route: payload.route.as_signed_str().to_string(),
+                clientId: payload.client_id.to_string(),
+                nonce: payload.nonce,
+            };
+            self.signer.sign_typed_data(&message, &domain).await
+        }
+        .map_err(|e| ClientError::Signing(format!("Failed to sign PlaceOrder: {}", e)))?;
 
         Ok(format!("{}", signature))
     }
@@ -648,24 +1010,36 @@ impl HypercallWallet {
         &self,
         payload: ReplaceOrderSignature<'_>,
     ) -> Result<String> {
-        let message = ReplaceOrder {
-            wallet: payload.wallet.as_wallet_address().inner(),
-            orderId: payload.order_id.to_string(),
-            symbol: payload.symbol.to_string(),
-            side: payload.side.to_string(),
-            size: payload.size.to_string(),
-            price: payload.price.to_string(),
-            tif: payload.tif.to_string(),
-            clientId: payload.client_id.to_string(),
-            nonce: payload.nonce,
-        };
-
         let domain = self.hypercall_domain();
-        let signature = self
-            .signer
-            .sign_typed_data(&message, &domain)
-            .await
-            .map_err(|e| ClientError::Signing(format!("Failed to sign ReplaceOrder: {}", e)))?;
+        let signature = if payload.reduce_only {
+            let message = ReplaceOrderReduceOnly {
+                wallet: payload.wallet.as_wallet_address().inner(),
+                orderId: payload.order_id.to_string(),
+                symbol: payload.symbol.to_string(),
+                side: payload.side.to_string(),
+                size: payload.size.to_string(),
+                price: payload.price.to_string(),
+                tif: payload.tif.to_string(),
+                clientId: payload.client_id.to_string(),
+                reduceOnly: true,
+                nonce: payload.nonce,
+            };
+            self.signer.sign_typed_data(&message, &domain).await
+        } else {
+            let message = ReplaceOrder {
+                wallet: payload.wallet.as_wallet_address().inner(),
+                orderId: payload.order_id.to_string(),
+                symbol: payload.symbol.to_string(),
+                side: payload.side.to_string(),
+                size: payload.size.to_string(),
+                price: payload.price.to_string(),
+                tif: payload.tif.to_string(),
+                clientId: payload.client_id.to_string(),
+                nonce: payload.nonce,
+            };
+            self.signer.sign_typed_data(&message, &domain).await
+        }
+        .map_err(|e| ClientError::Signing(format!("Failed to sign ReplaceOrder: {}", e)))?;
 
         Ok(format!("{}", signature))
     }
@@ -907,6 +1281,7 @@ mod tests {
             tif: "gtc",
             route: OrderRoute::BestExecution,
             client_id: "cli_1",
+            reduce_only: false,
             nonce,
         }
     }
@@ -921,6 +1296,7 @@ mod tests {
             price: "100",
             tif: "gtc",
             client_id: "cli_replace",
+            reduce_only: false,
             nonce,
         }
     }
@@ -1049,6 +1425,7 @@ mod tests {
                 tif: "gtc",
                 route: OrderRoute::BookOnly,
                 client_id: "cli_1",
+                reduce_only: false,
                 nonce,
             })
             .await
@@ -1067,6 +1444,59 @@ mod tests {
         };
         let recovered = recover_typed_signer(&message, &wallet.hypercall_domain(), &signature);
         assert_eq!(recovered, wallet.address.as_wallet_address().inner());
+    }
+
+    #[tokio::test]
+    async fn test_sign_place_order_reduce_only_uses_reduce_only_payload() {
+        let wallet = HypercallWallet::from_private_key(TEST_PRIVATE_KEY, 998).unwrap();
+        let nonce = 8;
+
+        let signature = wallet
+            .sign_place_order_payload(PlaceOrderSignature {
+                wallet: wallet.address,
+                symbol: "BTC-20250131-100000-C",
+                side: "Sell",
+                size: "1",
+                price: "100",
+                tif: "gtc",
+                route: OrderRoute::BookOnly,
+                client_id: "cli_ro",
+                reduce_only: true,
+                nonce,
+            })
+            .await
+            .unwrap();
+
+        let reduce_only_message = PlaceOrderReduceOnly {
+            wallet: wallet.address.as_wallet_address().inner(),
+            symbol: "BTC-20250131-100000-C".to_string(),
+            side: "Sell".to_string(),
+            size: "1".to_string(),
+            price: "100".to_string(),
+            tif: "gtc".to_string(),
+            route: "book_only".to_string(),
+            clientId: "cli_ro".to_string(),
+            reduceOnly: true,
+            nonce,
+        };
+        let recovered =
+            recover_typed_signer(&reduce_only_message, &wallet.hypercall_domain(), &signature);
+        assert_eq!(recovered, wallet.address.as_wallet_address().inner());
+
+        let old_message = PlaceOrder {
+            wallet: wallet.address.as_wallet_address().inner(),
+            symbol: "BTC-20250131-100000-C".to_string(),
+            side: "Sell".to_string(),
+            size: "1".to_string(),
+            price: "100".to_string(),
+            tif: "gtc".to_string(),
+            route: "book_only".to_string(),
+            clientId: "cli_ro".to_string(),
+            nonce,
+        };
+        let old_recovered =
+            recover_typed_signer(&old_message, &wallet.hypercall_domain(), &signature);
+        assert_ne!(old_recovered, wallet.address.as_wallet_address().inner());
     }
 
     #[tokio::test]
@@ -1320,6 +1750,7 @@ mod tests {
                 price,
                 tif,
                 client_id,
+                reduce_only: false,
                 nonce,
             })
             .await
@@ -1339,4 +1770,61 @@ mod tests {
         let recovered = recover_typed_signer(&message, &wallet.hypercall_domain(), &signature);
         assert_eq!(recovered, wallet.address.as_wallet_address().inner());
     }
+
+    #[tokio::test]
+    async fn test_sign_replace_order_reduce_only_uses_reduce_only_payload() {
+        let wallet = HypercallWallet::from_private_key(TEST_PRIVATE_KEY, 998).unwrap();
+        let nonce = wallet.next_nonce();
+
+        let signature = wallet
+            .sign_replace_order_payload(ReplaceOrderSignature {
+                wallet: wallet.address,
+                order_id: "42",
+                symbol: "BTC-20250131-100000-C",
+                side: "Buy",
+                size: "1",
+                price: "100",
+                tif: "gtc",
+                client_id: "cli_replace_ro",
+                reduce_only: true,
+                nonce,
+            })
+            .await
+            .unwrap();
+
+        let reduce_only_message = ReplaceOrderReduceOnly {
+            wallet: wallet.address.as_wallet_address().inner(),
+            orderId: "42".to_string(),
+            symbol: "BTC-20250131-100000-C".to_string(),
+            side: "Buy".to_string(),
+            size: "1".to_string(),
+            price: "100".to_string(),
+            tif: "gtc".to_string(),
+            clientId: "cli_replace_ro".to_string(),
+            reduceOnly: true,
+            nonce,
+        };
+        let recovered =
+            recover_typed_signer(&reduce_only_message, &wallet.hypercall_domain(), &signature);
+        assert_eq!(recovered, wallet.address.as_wallet_address().inner());
+
+        let old_message = ReplaceOrder {
+            wallet: wallet.address.as_wallet_address().inner(),
+            orderId: "42".to_string(),
+            symbol: "BTC-20250131-100000-C".to_string(),
+            side: "Buy".to_string(),
+            size: "1".to_string(),
+            price: "100".to_string(),
+            tif: "gtc".to_string(),
+            clientId: "cli_replace_ro".to_string(),
+            nonce,
+        };
+        let old_recovered =
+            recover_typed_signer(&old_message, &wallet.hypercall_domain(), &signature);
+        assert_ne!(old_recovered, wallet.address.as_wallet_address().inner());
+    }
 }
+
+#[cfg(test)]
+#[path = "wallet_test.rs"]
+mod directive_tests;

@@ -4,6 +4,126 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseSdkEnumError {
+    kind: &'static str,
+    value: String,
+}
+
+impl ParseSdkEnumError {
+    fn new(kind: &'static str, value: impl Into<String>) -> Self {
+        Self {
+            kind,
+            value: value.into(),
+        }
+    }
+}
+
+impl fmt::Display for ParseSdkEnumError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "unknown {}: {}", self.kind, self.value)
+    }
+}
+
+impl std::error::Error for ParseSdkEnumError {}
+
+/// Margin regime selected for an account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MarginMode {
+    Standard,
+    Portfolio,
+}
+
+impl MarginMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Portfolio => "portfolio",
+        }
+    }
+
+    pub const fn is_portfolio(self) -> bool {
+        matches!(self, Self::Portfolio)
+    }
+}
+
+impl fmt::Display for MarginMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for MarginMode {
+    type Err = ParseSdkEnumError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "standard" => Ok(Self::Standard),
+            "portfolio" => Ok(Self::Portfolio),
+            _ => Err(ParseSdkEnumError::new("margin mode", value)),
+        }
+    }
+}
+
+/// Instrument family represented by a portfolio, order, fill, or WebSocket row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InstrumentKind {
+    Option,
+    Perp,
+}
+
+impl InstrumentKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Option => "option",
+            Self::Perp => "perp",
+        }
+    }
+}
+
+impl fmt::Display for InstrumentKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for InstrumentKind {
+    type Err = ParseSdkEnumError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "option" => Ok(Self::Option),
+            "perp" => Ok(Self::Perp),
+            _ => Err(ParseSdkEnumError::new("instrument kind", value)),
+        }
+    }
+}
+
+/// HyperCore time-in-force encoding used by managed perp directives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PerpTimeInForce {
+    Alo,
+    Gtc,
+    Ioc,
+}
+
+#[cfg(test)]
+#[path = "enums_test.rs"]
+mod tests;
+
+impl PerpTimeInForce {
+    pub const fn encoded(self) -> u8 {
+        match self {
+            Self::Alo => 1,
+            Self::Gtc => 2,
+            Self::Ioc => 3,
+        }
+    }
+}
+
 /// Order side (buy or sell).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Side {

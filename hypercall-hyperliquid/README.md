@@ -1,5 +1,6 @@
 # hypercall-hyperliquid
 
+
 Direct Hyperliquid implementation of the public `hypercall-client` perp venue
 trait.
 

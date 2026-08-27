@@ -42,12 +42,11 @@ use tracing::{info, warn};
 
 use hypercall_sdk_types::{
     api_models::MarketsResponse, ApiResponse, BulkCancelOrderResponse, BulkPlaceOrderRequest,
-    BulkPlaceOrderResponse, CompetitionAccountResponse, CompetitionLeaderboardResponse,
-    CompetitionPnlSummaryResponse, ExchangeInfoResponse, HistoricalPnlInterval,
-    HistoricalPnlResponse, HistoricalTheoInterval, HistoricalTheoResponse, InstrumentSpecResponse,
-    JsonRpcResponse, LiquidationStatusData, LiquidationStatusResponse, Market, OptionSummary,
-    OrderMessage, OrderRoute, PlaceOrderRequest, PortfolioResponse, PublicLiquidationsResponse,
-    ReplaceOrderRequest, Side, StandardMarginLiquidationOrderRequest,
+    BulkPlaceOrderResponse, ExchangeInfoResponse, HistoricalPnlInterval, HistoricalPnlResponse,
+    HistoricalTheoInterval, HistoricalTheoResponse, InstrumentSpecResponse, JsonRpcResponse,
+    LiquidationStatusData, LiquidationStatusResponse, MarginMode, Market, OptionSummary, Order,
+    OrderMessage, OrderRoute, OrdersApiResponse, PlaceOrderRequest, Portfolio, PortfolioResponse,
+    PublicLiquidationsResponse, ReplaceOrderRequest, Side, StandardMarginLiquidationOrderRequest,
     StandardMarginLiquidationOrderResponse, StandardMarginLiquidationPositionRequest, TimeInForce,
     WalletAddress,
 };
@@ -169,6 +168,7 @@ impl OrderDecimalInput for f64 {
 pub struct OrderOptions {
     pub route: Option<OrderRoute>,
     pub client_id: Option<String>,
+    pub reduce_only: Option<bool>,
     pub mmp_enabled: Option<bool>,
     pub builder_code_address: Option<AccountAddress>,
 }
@@ -265,7 +265,7 @@ impl HypercallClient {
         format!("{}{}", self.base_url, route)
     }
 
-    fn request(&self, method: Method, route: &str) -> RequestBuilder {
+    pub(crate) fn request(&self, method: Method, route: &str) -> RequestBuilder {
         self.client.request(method, self.route_url(route))
     }
 
@@ -288,7 +288,7 @@ impl HypercallClient {
         Self::ensure_success(request.send().await?, action).await
     }
 
-    async fn send_reqwest_json<T: serde::de::DeserializeOwned>(
+    pub(crate) async fn send_reqwest_json<T: serde::de::DeserializeOwned>(
         request: RequestBuilder,
         action: &str,
     ) -> Result<T> {
@@ -302,7 +302,11 @@ impl HypercallClient {
         sonic_json(Self::send(request, action).await?).await
     }
 
-    async fn send_json_body<T, B>(request: RequestBuilder, body: &B, action: &str) -> Result<T>
+    pub(crate) async fn send_json_body<T, B>(
+        request: RequestBuilder,
+        body: &B,
+        action: &str,
+    ) -> Result<T>
     where
         T: serde::de::DeserializeOwned,
         B: Serialize + ?Sized,
@@ -562,6 +566,7 @@ impl HypercallClient {
         let price_str = params.price.to_string();
         let size_str = params.size.to_string();
         let mmp_enabled = mmp_enabled_or_default(&params.options);
+        let reduce_only = params.options.reduce_only.unwrap_or(false);
         let client_id = params
             .options
             .client_id
@@ -577,6 +582,7 @@ impl HypercallClient {
                 tif: tif_str,
                 route,
                 client_id: &client_id,
+                reduce_only,
                 nonce,
             })
             .await?;
@@ -592,6 +598,7 @@ impl HypercallClient {
             client_id: Some(client_id),
             nonce,
             signature,
+            reduce_only,
             mmp_enabled,
             builder_code_address: optional_wallet_address(params.options.builder_code_address),
         };
@@ -677,6 +684,7 @@ impl HypercallClient {
         let size_str = params.size.to_string();
         let order_id_str = params.order_id.to_string();
         let mmp_enabled = mmp_enabled_or_default(&params.options);
+        let reduce_only = params.options.reduce_only.unwrap_or(false);
         let client_id = params
             .options
             .client_id
@@ -692,6 +700,7 @@ impl HypercallClient {
                 price: &price_str,
                 tif: tif_str,
                 client_id: &client_id,
+                reduce_only,
                 nonce,
             })
             .await?;
@@ -707,6 +716,7 @@ impl HypercallClient {
             client_id: Some(client_id),
             nonce,
             signature,
+            reduce_only,
             mmp_enabled,
             builder_code_address: optional_wallet_address(params.options.builder_code_address),
         };
@@ -769,6 +779,7 @@ impl HypercallClient {
             let price_str = order.price.to_string();
             let size_str = order.size.to_string();
             let mmp_enabled = mmp_enabled_or_default(&order.options);
+            let reduce_only = order.options.reduce_only.unwrap_or(false);
             let client_id = order
                 .options
                 .client_id
@@ -785,6 +796,7 @@ impl HypercallClient {
                     tif: tif_str,
                     route,
                     client_id: &client_id,
+                    reduce_only,
                     nonce,
                 })
                 .await?;
@@ -800,6 +812,7 @@ impl HypercallClient {
                 client_id: Some(client_id),
                 nonce,
                 signature,
+                reduce_only,
                 mmp_enabled,
                 builder_code_address: optional_wallet_address(order.options.builder_code_address),
             });
@@ -940,6 +953,7 @@ impl HypercallClient {
             let size_str = replacement.size.to_string();
             let order_id_str = replacement.order_id.to_string();
             let mmp_enabled = mmp_enabled_or_default(&replacement.options);
+            let reduce_only = replacement.options.reduce_only.unwrap_or(false);
             let client_id = replacement
                 .options
                 .client_id
@@ -955,6 +969,7 @@ impl HypercallClient {
                     price: &price_str,
                     tif: tif_str,
                     client_id: &client_id,
+                    reduce_only,
                     nonce,
                 })
                 .await?;
@@ -970,6 +985,7 @@ impl HypercallClient {
                 client_id: Some(client_id),
                 nonce,
                 signature,
+                reduce_only,
                 mmp_enabled,
                 builder_code_address: optional_wallet_address(
                     replacement.options.builder_code_address,
@@ -1007,6 +1023,32 @@ impl HypercallClient {
         }
 
         Self::send_sonic_json(self.client.get(&url), "get orders").await
+    }
+
+    /// Get one typed page of option and perp orders.
+    pub async fn get_orders_typed(
+        &self,
+        wallet: impl Into<AccountAddress>,
+        status: Option<&str>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<OrdersApiResponse> {
+        let wallet = wallet.into();
+        let mut query = vec![("wallet", wallet.to_string())];
+        if let Some(status_filter) = status {
+            query.push(("status", status_filter.to_string()));
+        }
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
+        if let Some(offset) = offset {
+            query.push(("offset", offset.to_string()));
+        }
+        Self::send_reqwest_json(
+            self.request(Method::GET, API_ROUTE_ORDERS).query(&query),
+            "get typed orders",
+        )
+        .await
     }
 
     /// Get the display username for a wallet.
@@ -1060,19 +1102,31 @@ impl HypercallClient {
     ) -> Result<Vec<Value>> {
         let wallet = wallet.into();
         let mut all_orders = Vec::new();
-        let page_size = 50;
         let mut offset = 0;
 
         loop {
             let mut url = format!(
-                "{}/orders?wallet={}&limit={}&offset={}",
-                self.base_url, wallet, page_size, offset
+                "{}/orders?wallet={}&offset={}",
+                self.base_url, wallet, offset
             );
             if let Some(status_filter) = status {
                 url.push_str(&format!("&status={}", status_filter));
             }
 
             let result: Value = Self::send_sonic_json(self.client.get(&url), "get orders").await?;
+            let pagination = result
+                .get("pagination")
+                .ok_or_else(|| invalid_orders_pagination("missing pagination object"))?;
+            let returned_limit = pagination
+                .get("limit")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| invalid_orders_pagination("invalid pagination.limit"))?;
+            let returned_offset = pagination
+                .get("offset")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| invalid_orders_pagination("invalid pagination.offset"))?;
             let data = result.get("data").unwrap_or(&result);
             let page: Vec<Value> = match data.as_array() {
                 Some(arr) => arr.iter().cloned().collect(),
@@ -1081,14 +1135,42 @@ impl HypercallClient {
 
             let count = page.len();
             all_orders.extend(page);
-
-            if count < page_size {
-                break;
+            match next_orders_page_offset(offset, returned_offset, returned_limit, count)? {
+                Some(next_offset) => offset = next_offset,
+                None => break,
             }
-            offset += count;
         }
 
         Ok(all_orders)
+    }
+
+    /// Get all option and perp orders as canonical typed rows.
+    pub async fn get_all_orders_typed(
+        &self,
+        wallet: impl Into<AccountAddress>,
+        status: Option<&str>,
+    ) -> Result<Vec<Order>> {
+        let wallet = wallet.into();
+        let mut orders = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = self
+                .get_orders_typed(wallet, status, None, Some(offset))
+                .await?;
+            let count = page.data.len();
+            let next_offset = next_orders_page_offset(
+                offset,
+                page.pagination.offset,
+                page.pagination.limit,
+                count,
+            )?;
+            orders.extend(page.data);
+            match next_offset {
+                Some(next_offset) => offset = next_offset,
+                None => break,
+            }
+        }
+        Ok(orders)
     }
 
     /// Get fills for a wallet.
@@ -1110,6 +1192,28 @@ impl HypercallClient {
         Self::send_sonic_json(self.client.get(&url), "get fills").await
     }
 
+    /// Get a typed page of option and perp fills.
+    pub async fn get_fills_typed(
+        &self,
+        wallet: impl Into<AccountAddress>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<hypercall_sdk_types::FillsResponse> {
+        let wallet = wallet.into();
+        let mut query = vec![("wallet", wallet.to_string())];
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
+        if let Some(offset) = offset {
+            query.push(("offset", offset.to_string()));
+        }
+        Self::send_reqwest_json(
+            self.request(Method::GET, "/fills").query(&query),
+            "get typed fills",
+        )
+        .await
+    }
+
     /// Get portfolio for a wallet.
     pub async fn get_portfolio(
         &self,
@@ -1120,6 +1224,34 @@ impl HypercallClient {
             self.client
                 .get(format!("{}/portfolio?wallet={}", self.base_url, wallet)),
             "get portfolio",
+        )
+        .await?;
+        if !result.success {
+            return Err(ClientError::Api {
+                status: 200,
+                message: result
+                    .error
+                    .unwrap_or_else(|| "Portfolio request failed".to_string()),
+            });
+        }
+        result.data.ok_or_else(|| ClientError::Api {
+            status: 200,
+            message: result
+                .error
+                .unwrap_or_else(|| "No portfolio data returned".to_string()),
+        })
+    }
+
+    /// Get the canonical portfolio-margin-compatible snapshot.
+    pub async fn get_portfolio_snapshot(
+        &self,
+        wallet: impl Into<AccountAddress>,
+    ) -> Result<Portfolio> {
+        let wallet = wallet.into();
+        let result: hypercall_sdk_types::CanonicalApiResponse<Portfolio> = Self::send_reqwest_json(
+            self.request(Method::GET, "/portfolio")
+                .query(&[("wallet", wallet.to_string())]),
+            "get canonical portfolio",
         )
         .await?;
         if !result.success {
@@ -1305,73 +1437,6 @@ impl HypercallClient {
         })
     }
 
-    /// Get competition pnl summary for a wallet.
-    pub async fn get_competition_summary(
-        &self,
-        wallet: impl Into<AccountAddress>,
-    ) -> Result<CompetitionPnlSummaryResponse> {
-        let wallet = wallet.into();
-        Self::send_sonic_json(
-            self.client.get(format!(
-                "{}/competition/summary?wallet={}",
-                self.base_url, wallet
-            )),
-            "get competition summary",
-        )
-        .await
-    }
-
-    /// Get competition leaderboard data.
-    pub async fn get_competition_leaderboard(
-        &self,
-        competition_id: i64,
-        sort_by: Option<&str>,
-        sort_order: Option<&str>,
-        limit: Option<usize>,
-        offset: Option<usize>,
-        wallet: Option<&AccountAddress>,
-    ) -> Result<CompetitionLeaderboardResponse> {
-        let mut request = self
-            .client
-            .get(format!("{}/competition/leaderboard", self.base_url))
-            .query(&[("competition_id", competition_id.to_string())]);
-
-        if let Some(value) = sort_by {
-            request = request.query(&[("sort_by", value)]);
-        }
-        if let Some(value) = sort_order {
-            request = request.query(&[("sort_order", value)]);
-        }
-        if let Some(value) = limit {
-            request = request.query(&[("limit", value.to_string())]);
-        }
-        if let Some(value) = offset {
-            request = request.query(&[("offset", value.to_string())]);
-        }
-        if let Some(value) = wallet {
-            request = request.query(&[("wallet", value.to_string())]);
-        }
-
-        Self::send_sonic_json(request, "get competition leaderboard").await
-    }
-
-    /// Get competition account pnl data for a wallet.
-    pub async fn get_competition_account(
-        &self,
-        wallet: impl Into<AccountAddress>,
-        competition_id: i64,
-    ) -> Result<CompetitionAccountResponse> {
-        let wallet = wallet.into();
-        Self::send_sonic_json(
-            self.client.get(format!(
-                "{}/competition/account?wallet={}&competition_id={}",
-                self.base_url, wallet, competition_id
-            )),
-            "get competition account",
-        )
-        .await
-    }
-
     /// Set margin mode for a wallet.
     pub async fn set_margin_mode(
         &self,
@@ -1409,6 +1474,15 @@ impl HypercallClient {
 
         let result: Value = sonic_json(response).await?;
         Ok(result)
+    }
+
+    /// Set an account's margin mode using the typed SDK enum.
+    pub async fn set_margin_mode_typed(
+        &self,
+        wallet: &HypercallWallet,
+        margin_mode: MarginMode,
+    ) -> Result<Value> {
+        self.set_margin_mode(wallet, margin_mode.as_str()).await
     }
 
     pub async fn submit_standard_margin_liquidation_with_params<S>(
@@ -1701,11 +1775,42 @@ impl std::fmt::Debug for HypercallClient {
     }
 }
 
+fn invalid_orders_pagination(message: &str) -> ClientError {
+    ClientError::Api {
+        status: 200,
+        message: format!("invalid orders pagination: {message}"),
+    }
+}
+
+fn next_orders_page_offset(
+    requested_offset: usize,
+    returned_offset: usize,
+    returned_limit: usize,
+    returned_count: usize,
+) -> Result<Option<usize>> {
+    if returned_limit == 0 {
+        return Err(invalid_orders_pagination(
+            "pagination.limit must be greater than zero",
+        ));
+    }
+    if returned_count < returned_limit {
+        return Ok(None);
+    }
+
+    let next_offset = returned_offset
+        .checked_add(returned_count)
+        .ok_or_else(|| invalid_orders_pagination("next offset overflowed usize"))?;
+    if next_offset <= requested_offset {
+        return Err(invalid_orders_pagination(
+            "returned page does not advance the offset",
+        ));
+    }
+    Ok(Some(next_offset))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sonic_rs::from_str;
-
     #[test]
     fn test_client_new() {
         let client = HypercallClient::new("http://localhost:3000");
@@ -1741,62 +1846,6 @@ mod tests {
         let client = HypercallClient::new("http://localhost:3000");
         let cloned = client.clone();
         assert_eq!(cloned.base_url, client.base_url);
-    }
-
-    #[test]
-    fn test_competition_summary_response_deserializes() {
-        let response = from_str::<CompetitionPnlSummaryResponse>(
-            r#"{
-                "success": true,
-                "data": {
-                    "wallet": "0x0000000000000000000000000000000000000001",
-                    "lifetime_realized_pnl": "1250.5",
-                    "active_competition": {
-                        "competition_id": 9,
-                        "competition_name": "Spring Sprint",
-                        "competition_state": "active",
-                        "rank": 3,
-                        "pnl": "420.25",
-                        "volume": "25000",
-                        "efficiency": "0.01681",
-                        "medal": 3
-                    }
-                }
-            }"#,
-        )
-        .expect("competition summary should deserialize");
-
-        assert!(response.success);
-        assert_eq!(response.data.active_competition.unwrap().competition_id, 9);
-    }
-
-    #[test]
-    fn test_competition_account_response_deserializes() {
-        let response = from_str::<CompetitionAccountResponse>(
-            r#"{
-                "success": true,
-                "data": {
-                    "wallet": "0x0000000000000000000000000000000000000001",
-                    "username": "trader_1",
-                    "lifetime_realized_pnl": "99.5",
-                    "competition": {
-                        "competition_id": 11,
-                        "competition_name": "Weekend Cup",
-                        "competition_state": "post",
-                        "rank": null,
-                        "pnl": "0",
-                        "volume": "0",
-                        "efficiency": "0",
-                        "medal": null
-                    }
-                }
-            }"#,
-        )
-        .expect("competition account should deserialize");
-
-        assert!(response.success);
-        assert_eq!(response.data.username, "trader_1");
-        assert_eq!(response.data.competition.competition_state, "post");
     }
 
     #[test]

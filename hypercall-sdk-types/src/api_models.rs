@@ -6,7 +6,15 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::{Side, TradingModes, WalletAddress};
+use crate::{InstrumentKind, MarginMode, ParseSdkEnumError, Side, TradingModes, WalletAddress};
+
+fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
 
 fn decimal_or_zero<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Decimal, D::Error> {
     Option::<Decimal>::deserialize(d).map(|o| o.unwrap_or_default())
@@ -135,6 +143,8 @@ pub struct PositionWithMetrics {
     /// Core position fields, flattened into the top-level JSON object.
     #[serde(flatten)]
     pub position: Position,
+    /// Instrument family for this position (`"option"` or `"perp"`).
+    pub instrument_type: String,
     /// Dollar notional value of the position. Serialized as a string.
     pub notional_value: Decimal,
     /// Maintenance margin requirement in USD. Serialized as a string.
@@ -143,6 +153,12 @@ pub struct PositionWithMetrics {
     pub liquidation_price: Decimal,
     /// Margin utilization ratio (margin_used / equity). Serialized as a string.
     pub margin_ratio: Decimal,
+}
+
+impl PositionWithMetrics {
+    pub fn instrument_kind(&self) -> Result<InstrumentKind, ParseSdkEnumError> {
+        self.instrument_type.parse()
+    }
 }
 
 /// USDC balance for a single trading account.
@@ -187,10 +203,6 @@ pub use crate::responses::MarginSummary;
 
 // ---- Portfolio ----
 
-fn default_margin_mode() -> String {
-    "standard".to_string()
-}
-
 /// Full portfolio snapshot for a single account.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Portfolio {
@@ -202,15 +214,25 @@ pub struct Portfolio {
     pub total_margin_used: Decimal,
     /// Free collateral available for new trades in USD. Serialized as a string.
     pub available_balance: Decimal,
+    /// Account.sol USDC currently eligible for a direct PM withdrawal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub withdrawable_usdc: Option<Decimal>,
+    /// Source timestamp of the authoritative Hydromancer portfolio snapshot.
+    pub portfolio_snapshot_timestamp_ms: Option<u64>,
     /// SPAN margin breakdown, present when the account uses portfolio margin.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub span_margin: Option<SpanMarginSummary>,
-    /// Margin mode for this account (`"standard"` or `"portfolio"`). Defaults to `"standard"`.
-    #[serde(default = "default_margin_mode")]
+    /// Margin mode for this account (`"standard"` or `"portfolio"`).
     pub margin_mode: String,
     /// Unified margin summary, present when computed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub margin_summary: Option<MarginSummary>,
+}
+
+impl Portfolio {
+    pub fn margin_mode_kind(&self) -> Result<MarginMode, ParseSdkEnumError> {
+        self.margin_mode.parse()
+    }
 }
 
 // ---- Risk grid ----
@@ -279,6 +301,17 @@ pub struct ExtendedRiskMatrixResponse {
     pub worst_scenario_pnl: Decimal,
 }
 
+/// SPAN scenarios and aligned instrument matrix for one underlying.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnderlyingRiskGridResponse {
+    /// Underlying symbol whose configured shocks produced this matrix.
+    pub underlying: String,
+    /// Scenario results using this underlying's exact configured shocks.
+    pub scenarios: Vec<RiskGridScenario>,
+    /// Per-instrument matrix aligned with `scenarios`.
+    pub extended_risk_matrix: ExtendedRiskMatrixResponse,
+}
+
 /// Top-level SPAN risk grid response for an account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskGridResponse {
@@ -288,7 +321,8 @@ pub struct RiskGridResponse {
     pub position_initial_margin: Decimal,
     /// Maintenance margin for existing positions in USD. Serialized as a string.
     pub position_maintenance_margin: Decimal,
-    /// Initial margin reserved for open orders in USD. Serialized as a string.
+    /// Direct additive price-band and perp-factor reservation for open orders in USD.
+    /// Serialized as a string.
     pub open_orders_initial_margin: Decimal,
     /// Combined initial margin (positions + open orders) in USD. Serialized as a string.
     pub total_initial_margin: Decimal,
@@ -298,11 +332,8 @@ pub struct RiskGridResponse {
     pub option_floor: Decimal,
     /// Gamma overlay charge in USD. Serialized as a string.
     pub gamma_overlay: Decimal,
-    /// Individual scenario results.
-    pub scenarios: Vec<RiskGridScenario>,
-    /// Detailed per-instrument risk matrix, present when requested.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extended_risk_matrix: Option<ExtendedRiskMatrixResponse>,
+    /// Independently configured executed-position scenario and instrument grids by underlying.
+    pub underlyings: Vec<UnderlyingRiskGridResponse>,
 }
 
 // ---- Trade/Fill responses ----
@@ -326,6 +357,8 @@ pub struct TradeApiResponse {
     pub maker_fee: Decimal,
     /// Fee charged to the taker in USD. Serialized as a string.
     pub taker_fee: Decimal,
+    /// Direction of the taker's fill.
+    pub taker_side: Side,
     /// Trade timestamp in milliseconds since epoch.
     pub timestamp: i64,
     /// When the trade was persisted (ISO 8601).
@@ -376,6 +409,14 @@ pub struct FillApiResponse {
     pub realized_pnl: Option<Decimal>,
     /// Link to the on-chain transaction, if settled.
     pub explorer_url: Option<String>,
+    /// Instrument family that produced this fill (`"option"` or `"perp"`).
+    pub instrument_type: String,
+}
+
+impl FillApiResponse {
+    pub fn instrument_kind(&self) -> Result<InstrumentKind, ParseSdkEnumError> {
+        self.instrument_type.parse()
+    }
 }
 
 /// Paginated list of fills.
@@ -406,8 +447,9 @@ pub struct Order {
     pub price: Decimal,
     /// Order size in contracts. Serialized as a string.
     pub size: Decimal,
-    /// Time-in-force policy (e.g. `"GTC"`, `"IOC"`, `"FOK"`).
-    pub tif: String,
+    /// Time-in-force policy (e.g. `"GTC"`, `"IOC"`, `"FOK"`), when the source exposes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tif: Option<String>,
     /// Current order status (e.g. `"open"`, `"filled"`, `"cancelled"`).
     pub status: Option<String>,
     /// Order creation timestamp in milliseconds since epoch.
@@ -417,10 +459,38 @@ pub struct Order {
     /// Cumulative filled size in contracts. Serialized as a string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filled_size: Option<Decimal>,
+    /// Client-assigned order identifier, when one was supplied.
+    #[serde(deserialize_with = "required_option")]
+    pub client_id: Option<String>,
+    /// Whether the order can only reduce an existing position.
+    ///
+    /// Historical option records may not contain this field. `None` preserves
+    /// that absence instead of inventing order intent.
+    #[serde(deserialize_with = "required_option")]
+    pub reduce_only: Option<bool>,
     /// Whether Market Maker Protection is enabled for this order.
     #[serde(default)]
     pub mmp_enabled: bool,
+    /// Instrument family that produced this order (`"option"` or `"perp"`).
+    pub instrument_type: String,
 }
+
+impl Order {
+    pub fn instrument_kind(&self) -> Result<InstrumentKind, ParseSdkEnumError> {
+        self.instrument_type.parse()
+    }
+}
+
+/// Canonical paginated `/orders` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrdersResponse {
+    pub success: bool,
+    pub data: Vec<Order>,
+    pub pagination: crate::Pagination,
+}
+
+/// Unambiguous root-level alias for the canonical orders response.
+pub type OrdersApiResponse = OrdersResponse;
 
 // ---- Instrument ----
 
@@ -498,6 +568,7 @@ pub struct MarketsResponse {
 
 /// Absolute (per-contract) option Greeks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct OptionsChainGreeksAbs {
     /// Delta: rate of change of option price with respect to underlying price.
     pub delta: f64,
@@ -511,6 +582,7 @@ pub struct OptionsChainGreeksAbs {
 
 /// Cash-denominated option Greeks (dollar impact per unit move).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct OptionsChainGreeksCash {
     /// Dollar PnL for a 1% move in the underlying.
     pub delta_1pct_usd: f64,
@@ -524,10 +596,12 @@ pub struct OptionsChainGreeksCash {
 
 /// A single call or put leg in the options chain, including top-of-book quotes and Greeks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct OptionsChainLeg {
     /// Instrument symbol (e.g. `"BTC-20260101-100000-C"`).
     pub symbol: String,
     /// On-chain option token address, if deployed (checksummed Ethereum address).
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub option_token_address: Option<WalletAddress>,
     /// Best bid price in USD.
     pub bid_price_usd: Option<f64>,
@@ -553,6 +627,7 @@ pub struct OptionsChainLeg {
 
 /// A single strike row in the options chain, pairing call and put legs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct OptionsChainStrikeRow {
     /// Strike price in USD.
     pub strike: f64,
@@ -710,6 +785,8 @@ pub struct MmpConfigData {
     pub vega_limit: Option<Decimal>,
     /// Whether MMP is currently active for this wallet/currency pair.
     pub enabled: bool,
+    /// Highest committed signed nonce. The next mutation must use `nonce + 1`.
+    pub nonce: u64,
 }
 
 /// Signed request to create or update an MMP configuration.
@@ -732,7 +809,7 @@ pub struct SetMmpConfigRequest {
     /// Maximum net vega limit. Serialized as a string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vega_limit: Option<Decimal>,
-    /// Monotonically increasing nonce for replay protection.
+    /// Replay-protection nonce, exactly one greater than the committed nonce.
     pub nonce: u64,
     /// EIP-712 signature authorizing this request.
     pub signature: String,
@@ -745,7 +822,7 @@ pub struct DeleteMmpConfigRequest {
     pub wallet: WalletAddress,
     /// Underlying currency to delete MMP config for.
     pub currency: String,
-    /// Monotonically increasing nonce for replay protection.
+    /// Replay-protection nonce, exactly one greater than the committed nonce.
     pub nonce: u64,
     /// EIP-712 signature authorizing this request.
     pub signature: String,
@@ -758,7 +835,7 @@ pub struct ResetMmpRequest {
     pub wallet: WalletAddress,
     /// Underlying currency to reset MMP for.
     pub currency: String,
-    /// Monotonically increasing nonce for replay protection.
+    /// Replay-protection nonce, exactly one greater than the committed nonce.
     pub nonce: u64,
     /// EIP-712 signature authorizing this request.
     pub signature: String,
@@ -844,160 +921,6 @@ pub struct MarginModeApiResponse {
     pub error: Option<String>,
 }
 
-// ---- Competition types ----
-
-/// Lifecycle state of a trading competition. Serialized as lowercase.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CompetitionStateValue {
-    /// Competition has not started yet.
-    Pre,
-    /// Competition is currently running.
-    Active,
-    /// Competition has ended.
-    Post,
-}
-
-/// Field to sort the leaderboard by. Serialized as lowercase.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CompetitionSortByValue {
-    /// Sort by realized PnL.
-    Pnl,
-    /// Sort by traded volume.
-    Volume,
-    /// Sort by capital efficiency (PnL / margin used).
-    Efficiency,
-}
-
-/// Sort direction for leaderboard queries. Serialized as lowercase.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CompetitionSortOrderValue {
-    /// Ascending order.
-    Asc,
-    /// Descending order.
-    Desc,
-}
-
-/// Metric used to determine competition winners. Serialized as lowercase.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum CompetitionWinConditionValue {
-    /// Winner determined by highest realized PnL.
-    Pnl,
-    /// Winner determined by highest traded volume.
-    Volume,
-    /// Winner determined by highest capital efficiency.
-    Efficiency,
-}
-
-/// Full metadata for a trading competition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompetitionData {
-    /// Unique competition identifier.
-    pub id: i64,
-    /// Display name of the competition.
-    pub name: String,
-    /// Optional short description.
-    pub description: Option<String>,
-    /// Optional URL to external rules page.
-    pub rules_url: Option<String>,
-    /// Optional inline rules content (Markdown).
-    pub rules_content: Option<String>,
-    /// Metrics tracked for ranking (e.g. `["pnl", "volume"]`).
-    pub win_conditions: Vec<String>,
-    /// Primary metric used to determine the overall winner.
-    pub primary_win_condition: String,
-    /// Competition start time in milliseconds since epoch.
-    pub start_ts_ms: i64,
-    /// Competition end time in milliseconds since epoch.
-    pub end_ts_ms: i64,
-    /// Current lifecycle state (`"pre"`, `"active"`, or `"post"`).
-    pub state: String,
-    /// When this competition was created (ISO 8601).
-    pub created_at: DateTime<Utc>,
-    /// When this competition was last updated (ISO 8601).
-    pub updated_at: DateTime<Utc>,
-}
-
-/// Paginated list of competitions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompetitionsResponse {
-    /// Whether the request succeeded.
-    pub success: bool,
-    /// Competition records for the current page.
-    pub data: Vec<CompetitionData>,
-    /// Pagination metadata.
-    pub pagination: crate::Pagination,
-}
-
-/// Response containing a single competition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompetitionResponse {
-    /// Whether the request succeeded.
-    pub success: bool,
-    /// Competition details.
-    pub data: CompetitionData,
-}
-
-/// A single row on the competition leaderboard.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LeaderboardRow {
-    /// 1-based rank on the leaderboard.
-    pub rank: usize,
-    /// Participant wallet address (checksummed Ethereum address).
-    pub wallet: WalletAddress,
-    /// Display username.
-    pub username: String,
-    /// Realized PnL during the competition in USD. Serialized as a string.
-    pub pnl: Decimal,
-    /// Total traded volume during the competition in USD. Serialized as a string.
-    pub volume: Decimal,
-    /// Capital efficiency (PnL / margin used). Serialized as a string.
-    pub efficiency: Decimal,
-    /// Medal tier (1 = gold, 2 = silver, 3 = bronze), if awarded.
-    pub medal: Option<u8>,
-}
-
-/// The requesting (connected) user's own rank on the leaderboard.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConnectedUserRank {
-    /// Connected user's wallet address (checksummed Ethereum address).
-    pub wallet: WalletAddress,
-    /// Display username.
-    pub username: String,
-    /// Current rank, if the user is on the leaderboard.
-    pub rank: Option<usize>,
-    /// Realized PnL in USD. Serialized as a string.
-    pub pnl: Option<Decimal>,
-    /// Traded volume in USD. Serialized as a string.
-    pub volume: Option<Decimal>,
-    /// Capital efficiency. Serialized as a string.
-    pub efficiency: Option<Decimal>,
-    /// Medal tier, if awarded.
-    pub medal: Option<u8>,
-}
-
-/// Paginated competition leaderboard with optional connected-user context.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompetitionLeaderboardResponse {
-    /// Whether the request succeeded.
-    pub success: bool,
-    /// Competition this leaderboard belongs to.
-    pub competition_id: i64,
-    /// Field the leaderboard is sorted by.
-    pub sort_by: String,
-    /// Sort direction.
-    pub sort_order: String,
-    /// Leaderboard rows for the current page.
-    pub data: Vec<LeaderboardRow>,
-    /// The connected user's own rank, if authenticated.
-    pub connected_user: Option<ConnectedUserRank>,
-    /// Pagination metadata.
-    pub pagination: crate::Pagination,
-}
-
 /// Realized PnL breakdown for one instrument symbol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RealizedPnlRow {
@@ -1044,47 +967,15 @@ pub struct ProfilePnlStats {
     pub lifetime_realized: Decimal,
 }
 
-/// Summary of a user's rank in a specific competition, shown on their profile.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProfileCompetitionRankSummary {
-    /// Competition identifier.
-    pub competition_id: i64,
-    /// Competition display name.
-    pub competition_name: String,
-    /// Competition lifecycle state.
-    pub competition_state: String,
-    /// User's rank in this competition.
-    pub rank: usize,
-    /// User's realized PnL in this competition in USD. Serialized as a string.
-    pub pnl: Decimal,
-    /// User's traded volume in this competition in USD. Serialized as a string.
-    pub volume: Decimal,
-    /// User's capital efficiency in this competition. Serialized as a string.
-    pub efficiency: Decimal,
-    /// Medal tier, if awarded.
-    pub medal: Option<u8>,
-}
-
-/// Platform-wide medals earned by a user across all competitions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProfileMetricMedals {
-    /// Best PnL medal tier (1 = gold, 2 = silver, 3 = bronze).
-    pub pnl: Option<u8>,
-    /// Best volume medal tier.
-    pub volume: Option<u8>,
-    /// Best efficiency medal tier.
-    pub efficiency: Option<u8>,
-}
-
 /// Aggregated profile data for a single user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileData {
-    /// User's wallet address (checksummed Ethereum address).
+    /// Requested identity wallet address (checksummed Ethereum address).
     pub wallet: WalletAddress,
+    /// Resolved trading account whose financial statistics are returned.
+    pub account_wallet: WalletAddress,
     /// Display username.
     pub username: String,
-    /// Moderated profile image URL, if set.
-    pub profile_image_url: Option<String>,
     /// Timestamp when the account was first observed (ms since epoch).
     pub account_first_seen_ts_ms: Option<i64>,
     /// Number of days since the account was first seen.
@@ -1093,13 +984,6 @@ pub struct ProfileData {
     pub margin: ProfileMarginStats,
     /// PnL statistics.
     pub pnl: ProfilePnlStats,
-    /// Best overall medal tier across all competitions.
-    pub medal: Option<u8>,
-    /// Per-metric best medals across all competitions.
-    pub platform_medals: ProfileMetricMedals,
-    /// Rank in the currently active competition, if participating.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub active_competition_rank: Option<ProfileCompetitionRankSummary>,
 }
 
 /// Response containing a user's full profile.
@@ -1159,42 +1043,47 @@ mod tests {
     }
 
     #[test]
-    fn profile_image_url_serde_contract() {
-        for profile_image_url in [
-            serde_json::json!("https://example.com/profile.png"),
-            serde_json::Value::Null,
-        ] {
-            let input = serde_json::json!({
-                "wallet": "0x0000000000000000000000000000000000000000",
-                "username": "alice",
-                "profile_image_url": profile_image_url,
-                "account_first_seen_ts_ms": null,
-                "account_age_days": null,
-                "margin": {
-                    "in_use": "0",
-                    "available": "0",
-                    "total": "0",
-                    "deposits": "0",
-                    "withdraws": "0"
+    fn risk_grid_serializes_only_per_underlying_matrices() {
+        let response = RiskGridResponse {
+            equity: dec!(100),
+            position_initial_margin: dec!(10),
+            position_maintenance_margin: dec!(5),
+            open_orders_initial_margin: dec!(2),
+            total_initial_margin: dec!(12),
+            scanning_risk: dec!(8),
+            option_floor: dec!(1),
+            gamma_overlay: dec!(0),
+            underlyings: vec![
+                UnderlyingRiskGridResponse {
+                    underlying: "BTC".to_string(),
+                    scenarios: vec![],
+                    extended_risk_matrix: ExtendedRiskMatrixResponse {
+                        scenarios: vec![],
+                        instruments: vec![],
+                        total_pnls: vec![],
+                        worst_scenario_index: 0,
+                        worst_scenario_pnl: dec!(0),
+                    },
                 },
-                "pnl": {
-                    "unrealized": "0",
-                    "pnl_24h": "0",
-                    "lifetime_realized": "0"
+                UnderlyingRiskGridResponse {
+                    underlying: "AAPL".to_string(),
+                    scenarios: vec![],
+                    extended_risk_matrix: ExtendedRiskMatrixResponse {
+                        scenarios: vec![],
+                        instruments: vec![],
+                        total_pnls: vec![],
+                        worst_scenario_index: 0,
+                        worst_scenario_pnl: dec!(0),
+                    },
                 },
-                "medal": null,
-                "platform_medals": {
-                    "pnl": null,
-                    "volume": null,
-                    "efficiency": null
-                },
-                "active_competition_rank": null
-            });
+            ],
+        };
 
-            let profile: ProfileData = serde_json::from_value(input.clone()).unwrap();
-            let output = serde_json::to_value(&profile).unwrap();
-            assert_eq!(output["profile_image_url"], input["profile_image_url"]);
-        }
+        let json = serde_json::to_value(response).expect("risk grid should serialize");
+        assert_eq!(json["underlyings"][0]["underlying"], "BTC");
+        assert_eq!(json["underlyings"][1]["underlying"], "AAPL");
+        assert!(json.get("scenarios").is_none());
+        assert!(json.get("extended_risk_matrix").is_none());
     }
 
     #[test]
@@ -1262,6 +1151,7 @@ mod tests {
                 unrealized_pnl: dec!(-10),
                 updated_at: chrono::Utc::now(),
             },
+            instrument_type: "option".to_string(),
             notional_value: dec!(-450),
             maintenance_margin: dec!(0),
             liquidation_price: dec!(0),
@@ -1288,6 +1178,7 @@ mod tests {
             "realized_pnl": "0",
             "unrealized_pnl": "50",
             "updated_at": "2026-01-01T00:00:00Z",
+            "instrument_type": "option",
             "notional_value": "6000",
             "maintenance_margin": "0",
             "liquidation_price": "0",
@@ -1296,7 +1187,24 @@ mod tests {
         let pwm: PositionWithMetrics = serde_json::from_value(json).unwrap();
         assert_eq!(pwm.position.symbol, "BTC-20260101-100000-C");
         assert_eq!(pwm.position.amount, dec!(2));
+        assert_eq!(pwm.instrument_kind().unwrap(), InstrumentKind::Option);
         assert_eq!(pwm.notional_value, dec!(6000));
+
+        let missing_kind = serde_json::json!({
+            "wallet_address": "0x0000000000000000000000000000000000000001",
+            "symbol": "BTC-PERP",
+            "amount": "2",
+            "entry_price": "3000",
+            "margin_posted": "100",
+            "realized_pnl": "0",
+            "unrealized_pnl": "50",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "notional_value": "6000",
+            "maintenance_margin": "0",
+            "liquidation_price": "0",
+            "margin_ratio": "0"
+        });
+        assert!(serde_json::from_value::<PositionWithMetrics>(missing_kind).is_err());
     }
 
     #[test]
@@ -1327,6 +1235,8 @@ mod tests {
             positions: vec![],
             total_margin_used: dec!(0),
             available_balance: dec!(1000),
+            withdrawable_usdc: None,
+            portfolio_snapshot_timestamp_ms: None,
             span_margin: None,
             margin_mode: "standard".to_string(),
             margin_summary: None,
@@ -1344,16 +1254,14 @@ mod tests {
     }
 
     #[test]
-    fn portfolio_deserializes_without_optional_fields() {
+    fn portfolio_requires_margin_mode() {
         let json = serde_json::json!({
             "wallet_address": "0x0000000000000000000000000000000000000000",
             "positions": [],
             "total_margin_used": "0",
             "available_balance": "1000"
         });
-        let portfolio: Portfolio = serde_json::from_value(json).unwrap();
-        assert_eq!(portfolio.margin_mode, "standard");
-        assert!(portfolio.span_margin.is_none());
+        assert!(serde_json::from_value::<Portfolio>(json).is_err());
     }
 
     #[test]
@@ -1448,10 +1356,111 @@ mod tests {
             builder_code_fee: None,
             realized_pnl: Some(dec!(150)),
             explorer_url: None,
+            instrument_type: "option".to_string(),
         };
         let json = serde_json::to_value(&fill).unwrap();
         assert_eq!(json["price"], "2500");
         assert_eq!(json["realized_pnl"], "150");
+    }
+
+    #[test]
+    fn order_decodes_missing_tif_with_required_instrument_type() {
+        let json = serde_json::json!({
+            "order_id": 42,
+            "wallet_address": WalletAddress::default(),
+            "symbol": "BTC-PERP",
+            "side": "Buy",
+            "price": "100000",
+            "size": "0.5",
+            "status": "open",
+            "created_at": 1700000000000_i64,
+            "updated_at": null,
+            "client_id": "perp-42",
+            "reduce_only": true,
+            "mmp_enabled": false,
+            "instrument_type": "perp"
+        });
+
+        let order: Order = serde_json::from_value(json).unwrap();
+
+        assert_eq!(order.tif, None);
+        assert_eq!(order.instrument_type, "perp");
+    }
+
+    #[test]
+    fn order_requires_instrument_type() {
+        let json = serde_json::json!({
+            "order_id": 42,
+            "wallet_address": WalletAddress::default(),
+            "symbol": "BTC-PERP",
+            "side": "Buy",
+            "price": "100000",
+            "size": "0.5",
+            "status": "open",
+            "created_at": 1700000000000_i64,
+            "updated_at": null,
+            "client_id": null,
+            "reduce_only": false,
+            "mmp_enabled": false
+        });
+
+        assert!(serde_json::from_value::<Order>(json).is_err());
+    }
+
+    #[test]
+    fn order_requires_nullable_metadata_keys() {
+        let order = serde_json::json!({
+            "order_id": 42,
+            "wallet_address": WalletAddress::default(),
+            "symbol": "BTC-PERP",
+            "side": "Buy",
+            "price": "100000",
+            "size": "0.5",
+            "tif": null,
+            "status": "open",
+            "created_at": 1700000000000_i64,
+            "updated_at": null,
+            "filled_size": null,
+            "client_id": null,
+            "reduce_only": null,
+            "mmp_enabled": false,
+            "instrument_type": "perp"
+        });
+
+        for required_key in ["client_id", "reduce_only"] {
+            let mut missing_key = order.clone();
+            missing_key
+                .as_object_mut()
+                .expect("order fixture must be an object")
+                .remove(required_key);
+            assert!(
+                serde_json::from_value::<Order>(missing_key).is_err(),
+                "missing {required_key} must fail canonical order decoding"
+            );
+        }
+    }
+
+    #[test]
+    fn fill_requires_instrument_type() {
+        let json = serde_json::json!({
+            "fill_id": 1,
+            "trade_id": 100,
+            "wallet_address": WalletAddress::default(),
+            "symbol": "BTC-PERP",
+            "price": "100000",
+            "size": "0.5",
+            "fee": "1",
+            "side": "Buy",
+            "is_taker": true,
+            "timestamp": 1700000000000_i64,
+            "created_at": chrono::Utc::now(),
+            "builder_code_address": null,
+            "builder_code_fee": null,
+            "realized_pnl": "0",
+            "explorer_url": null
+        });
+
+        assert!(serde_json::from_value::<FillApiResponse>(json).is_err());
     }
 
     #[test]
@@ -1462,22 +1471,6 @@ mod tests {
         let json_str = serde_json::to_string(&resp).unwrap();
         let parsed: HealthResponse = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed.status, "ok");
-    }
-
-    #[test]
-    fn competition_enums_serialize_lowercase() {
-        assert_eq!(
-            serde_json::to_string(&CompetitionStateValue::Active).unwrap(),
-            "\"active\""
-        );
-        assert_eq!(
-            serde_json::to_string(&CompetitionSortByValue::Pnl).unwrap(),
-            "\"pnl\""
-        );
-        assert_eq!(
-            serde_json::to_string(&CompetitionSortOrderValue::Desc).unwrap(),
-            "\"desc\""
-        );
     }
 
     #[test]
@@ -1512,12 +1505,14 @@ mod tests {
             delta_limit: None,
             vega_limit: Some(dec!(50000)),
             enabled: true,
+            nonce: 42,
         };
         let json_str = serde_json::to_string(&config).unwrap();
         let parsed: MmpConfigData = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed.qty_limit, Some(dec!(100)));
         assert_eq!(parsed.delta_limit, None);
         assert!(parsed.enabled);
+        assert_eq!(parsed.nonce, 42);
     }
 }
 
@@ -1526,6 +1521,10 @@ mod tests {
 pub struct ExchangeInfoResponse {
     /// Exchange contract address on HyperEVM (deposit destination).
     pub exchange_address: String,
+    /// Router used for direct Account.sol deposits when PM deposits are enabled.
+    pub deposit_router_address: Option<String>,
+    /// Whether direct portfolio-margin deposits are enabled in this environment.
+    pub portfolio_margin_deposits_enabled: bool,
     /// Chain ID for EIP-712 signing (999 = mainnet, 998 = testnet).
     pub chain_id: u64,
     /// EIP-712 signing domain info.
