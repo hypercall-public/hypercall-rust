@@ -3,9 +3,9 @@
 //! These DTOs describe HTTP payloads only. Exact financial amounts are
 //! decimal JSON strings at every magnitude.
 //!
-//! Compiled with the `rfq-v2` cargo feature (on by default since 0.3.0). An
-//! environment that has not enabled RFQ V2 answers every route with HTTP 403
-//! `rfq_v2_disabled`. Client-chosen operation IDs must be UUIDv7s at
+//! Compiled with the `rfq-v2` cargo feature (on by default since 0.3.0). RFQ V2
+//! is open to every account in production. Client-chosen operation IDs must be
+//! UUIDv7s at
 //! most one hour old and at most 30 seconds in the future at the server, or
 //! the server answers HTTP 400 `rfq_v2_invalid_operation_id`.
 

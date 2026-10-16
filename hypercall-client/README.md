@@ -1020,9 +1020,11 @@ Rules the server enforces:
   Resend the original with `reconcile_rfq_v2_execution` or
   `reconcile_rfq_v2_sweep`, which resend the identical bytes under the
   original operation ID.
-- **Availability**: an environment that has not enabled RFQ V2 answers 403
-  `rfq_v2_disabled` (`ClientError::RfqV2Api`). One limited to allowlisted
-  accounts answers 403 `rfq_v2_not_allowlisted` for other accounts.
+- **Availability**: RFQ V2 is open to every account on
+  `https://api.hypercall.xyz`. A non-production environment can run it
+  disabled, which answers every V2 route with 403 `rfq_v2_disabled`
+  (`ClientError::RfqV2Api`), or limited to an allowlist, which answers 403
+  `rfq_v2_not_allowlisted` to accounts not on it.
 
 ## WebSocket compression
 

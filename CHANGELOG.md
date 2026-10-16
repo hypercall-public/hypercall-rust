@@ -9,8 +9,8 @@ also carries the unreleased `0.2.0` changes below.
 
 ### Added: RFQ V2
 
-RFQ V2 is live in production from October 16, 2026, and the SDK covers the
-whole taker and maker surface.
+RFQ V2 is live in production for every account from October 16, 2026, and the
+SDK covers the whole taker and maker surface.
 
 - `hypercall-client::rfq_v2_signing` (new): EIP-712 signing for every RFQ V2
   action. `HypercallWallet` gains `sign_create_rfq_v2`,

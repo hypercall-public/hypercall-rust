@@ -8,14 +8,15 @@
 //! # Availability
 //!
 //! Compiled with the `rfq-v2` cargo feature, on by default since 0.3.0. RFQ V2
-//! is live in production from October 16, 2026. An environment that has not
-//! enabled it refuses every RFQ V2 request, including private reads and
+//! is open to every account in production from October 16, 2026.
+//!
+//! A non-production environment can run RFQ V2 in two other modes. Disabled,
+//! it refuses every RFQ V2 request, including private reads and
 //! `AuthenticateRfqV2` socket authentication, with HTTP 403 and error code
 //! `rfq_v2_disabled`. Over HTTP that surfaces as [`ClientError::RfqV2Api`]
 //! with `status: 403` and that `code`; on the socket,
-//! [`crate::WsClient::connect_rfq_v2`] fails. An environment that admits only
-//! allowlisted accounts answers 403 `rfq_v2_not_allowlisted` for every other
-//! account.
+//! [`crate::WsClient::connect_rfq_v2`] fails. Allowlist-only, it answers 403
+//! `rfq_v2_not_allowlisted` to accounts not on the list.
 //!
 //! # Operation IDs
 //!
