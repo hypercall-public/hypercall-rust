@@ -22,7 +22,11 @@
 //!   scope.
 //! - **RFQ priority lane**: [`QpScopedHandle::send_rfq_response`] carries a
 //!   deadline; responses are written before any pending indicative flush
-//!   and are dropped (with a callback) once expired rather than sent stale.
+//!   and are dropped once expired rather than sent stale. Every drop is
+//!   reported with the message itself via
+//!   [`QpClientCallbacks::on_rfq_response_dropped`] so the caller can
+//!   attribute it to an `rfq_id`, and also counted through the bulk
+//!   [`QpClientCallbacks::on_stale_messages_drained`] for compatibility.
 //! - **Connection state**: [`QpScopedHandle::connection_state`] exposes a
 //!   `watch` channel with the negotiated capabilities, so callers can gate
 //!   RFQ handling on connectivity instead of inferring it from callbacks.
@@ -40,8 +44,8 @@ use tracing::{info, warn};
 
 use crate::qp_client::{
     connect_and_auth, forward_inbound_or_close, ClientOutbound, IndicativeQuote, QpClientCallbacks,
-    QpClientConfig, QpDisconnectReason, QpWriteFailure, QpWriteOperation, ServerInbound,
-    WS_WRITE_TIMEOUT,
+    QpClientConfig, QpDisconnectReason, QpWriteFailure, QpWriteOperation, RfqDropReason,
+    ServerInbound, WS_WRITE_TIMEOUT,
 };
 use hypercall_ws_protocol::{ScopeId, CAP_SCOPED_INDICATIVE};
 
@@ -240,24 +244,14 @@ pub struct QpScopedHandle {
 }
 
 /// Error returned when an RFQ response cannot be queued.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[displaystr::display]
 pub enum RfqSendError {
     /// The bounded priority lane is full; the response was NOT queued.
-    LaneFull,
+    LaneFull = "RFQ priority lane full",
     /// The runtime task has exited.
-    RuntimeClosed,
+    RuntimeClosed = "scoped QP runtime closed",
 }
-
-impl std::fmt::Display for RfqSendError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::LaneFull => f.write_str("RFQ priority lane full"),
-            Self::RuntimeClosed => f.write_str("scoped QP runtime closed"),
-        }
-    }
-}
-
-impl std::error::Error for RfqSendError {}
 
 impl QpScopedHandle {
     /// Publish the latest indicative snapshot for one scope. Never blocks;
@@ -347,7 +341,10 @@ async fn next_outbound(
                     Ok(timed) if Instant::now() <= timed.deadline => {
                         return OutboundItem::Rfq(timed.message);
                     }
-                    Ok(_expired) => callbacks.on_stale_messages_drained(1),
+                    Ok(expired) => {
+                        callbacks.on_rfq_response_dropped(&expired.message, RfqDropReason::Expired);
+                        callbacks.on_stale_messages_drained(1);
+                    }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
                         rfq_open = false;
@@ -382,7 +379,10 @@ async fn next_outbound(
                     Some(timed) if Instant::now() <= timed.deadline => {
                         return OutboundItem::Rfq(timed.message);
                     }
-                    Some(_expired) => callbacks.on_stale_messages_drained(1),
+                    Some(expired) => {
+                        callbacks.on_rfq_response_dropped(&expired.message, RfqDropReason::Expired);
+                        callbacks.on_stale_messages_drained(1);
+                    }
                     None => rfq_open = false,
                 },
             }
@@ -594,14 +594,16 @@ async fn connect_and_run_scoped(
                         // (unlike indicative slots): report the loss so
                         // the caller can react before the taker's
                         // deadline lapses.
-                        if matches!(item, OutboundItem::Rfq(_)) {
+                        if let OutboundItem::Rfq(msg) = &item {
+                            callbacks.on_rfq_response_dropped(msg, RfqDropReason::WriteFailed);
                             callbacks.on_stale_messages_drained(1);
                         }
                         return Err(format!("Send outbound failed: {e}"));
                     }
                     Err(_) => {
                         callbacks.on_write_failed(QpWriteOperation::Outbound, QpWriteFailure::Timeout);
-                        if matches!(item, OutboundItem::Rfq(_)) {
+                        if let OutboundItem::Rfq(msg) = &item {
+                            callbacks.on_rfq_response_dropped(msg, RfqDropReason::WriteTimeout);
                             callbacks.on_stale_messages_drained(1);
                         }
                         return Err("Send outbound timed out".to_string());

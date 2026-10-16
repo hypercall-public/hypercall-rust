@@ -1,4 +1,9 @@
-use std::str::FromStr;
+#![expect(
+    clippy::result_large_err,
+    reason = "cycle execution preserves the public unboxed liquidation error contract"
+)]
+
+use std::{error::Error as StdError, str::FromStr};
 
 use futures::stream::{self, StreamExt, TryStreamExt};
 use hypercall_client::{
@@ -25,38 +30,44 @@ use crate::{
     },
 };
 
+/// Dynamically typed source retained by a liquidation-cycle error.
+pub type BoxCycleSource = Box<dyn StdError + Send + Sync + 'static>;
+
 #[derive(Debug, Error)]
+#[displaystr::display]
 pub enum CycleError {
-    #[error("invalid account address {account}: {detail}")]
-    InvalidAccount { account: String, detail: String },
-    #[error("portfolio read failed: {0}")]
-    PortfolioRead(#[from] hypercall_client::ClientError),
-    #[error("portfolio margin read failed: {0}")]
-    Reader(#[from] ReaderError),
-    #[error("candidate evaluation failed: {0}")]
-    Candidate(#[from] CandidateEvaluationError),
-    #[error("key resolution failed: {0}")]
-    Key(#[from] KeyError),
-    #[error("auction is no longer active before liquidation submit for {account}")]
-    AuctionInactiveBeforeSubmit { account: String },
-    #[error("fresh auction state is no longer eligible before liquidation submit: {0:?}")]
-    FreshAuctionNotEligible(CandidateDecision),
-    #[error("liquidation status not found for {account}")]
-    LiquidationStatusNotFound { account: String },
-    #[error("liquidation status for {account} is not active full standard-margin liquidation")]
-    LiquidationStatusNotFullStandardMargin { account: String },
-    #[error(
-        "liquidation status for {account} is missing current engine-priced bid terms: {field}"
-    )]
+    InvalidAccount {
+        account: String,
+        #[source]
+        detail: BoxCycleSource,
+    } = "invalid account address {account}: {detail}",
+    PortfolioRead(#[from] hypercall_client::ClientError) = "portfolio read failed: {_0}",
+    Reader(#[from] ReaderError) = "portfolio margin read failed: {_0}",
+    Candidate(#[from] CandidateEvaluationError) = "candidate evaluation failed: {_0}",
+    Key(#[from] KeyError) = "key resolution failed: {_0}",
+    AuctionInactiveBeforeSubmit {
+        account: String,
+    } = "auction is no longer active before liquidation submit for {account}",
+    FreshAuctionNotEligible(CandidateDecision) =
+        "fresh auction state is no longer eligible before liquidation submit: {_0:?}",
+    LiquidationStatusNotFound {
+        account: String,
+    } = "liquidation status not found for {account}",
+    LiquidationStatusNotFullStandardMargin {
+        account: String,
+    } = "liquidation status for {account} is not active full standard-margin liquidation",
     MissingCurrentBidTerms {
         account: String,
         field: &'static str,
-    },
-    #[error("cannot execute liquidation for skipped cycle")]
-    SkippedCycle,
+    } = "liquidation status for {account} is missing current engine-priced bid terms: {field}",
+    SkippedCycle = "cannot execute liquidation for skipped cycle",
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "boxing a serialized public liquidation decision would change its wire contract"
+)]
 pub enum CycleDecision {
     Eligible {
         candidate: LiquidationCandidate,
@@ -115,7 +126,7 @@ pub async fn read_standard_margin_liquidation_cycle(
 ) -> Result<CycleDecision, CycleError> {
     let wallet = WalletAddress::from_str(account).map_err(|source| CycleError::InvalidAccount {
         account: account.to_string(),
-        detail: source.to_string(),
+        detail: Box::new(source),
     })?;
     let account_address = AccountAddress::from(wallet);
     let status = api
@@ -160,6 +171,7 @@ pub async fn read_standard_margin_liquidation_cycle(
         equity: terms.equity,
         initial_margin_required: terms.mm_required,
         maintenance_margin_required: terms.mm_required,
+        maintenance_margin: terms.maintenance_margin,
     };
 
     let decision = plan_liquidation_cycle(
@@ -316,7 +328,7 @@ pub async fn execute_standard_margin_liquidation_cycle(
     let liquidated_wallet = WalletAddress::from_str(&candidate.account).map_err(|source| {
         CycleError::InvalidAccount {
             account: candidate.account.clone(),
-            detail: source.to_string(),
+            detail: Box::new(source),
         }
     })?;
     let liquidated_account = AccountAddress::from(liquidated_wallet);
@@ -347,6 +359,7 @@ pub async fn execute_standard_margin_liquidation_cycle(
         equity: terms.equity,
         initial_margin_required: terms.mm_required,
         maintenance_margin_required: terms.mm_required,
+        maintenance_margin: terms.maintenance_margin,
     };
     let candidate = LiquidationCandidate {
         margin,
@@ -548,6 +561,7 @@ mod tests {
             equity,
             initial_margin_required: dec!(1500),
             maintenance_margin_required: dec!(1000),
+            maintenance_margin: equity - dec!(1000),
         }
     }
 

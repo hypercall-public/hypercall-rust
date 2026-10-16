@@ -1,80 +1,11 @@
 use super::*;
+use crate::test_support::{json_body, serve_once, serve_sequence, FixedNonce};
 use crate::{HypercallWallet, NonceProvider};
 use rust_decimal_macros::dec;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 
 const PRIVATE_KEY: &str = "0x0000000000000000000000000000000000000000000000000000000000000001";
 const ACCOUNT: &str = "0x0000000000000000000000000000000000000002";
-
-struct FixedNonce(u64);
-
-impl NonceProvider for FixedNonce {
-    fn next_nonce(&self) -> u64 {
-        self.0
-    }
-
-    fn current_nonce(&self) -> u64 {
-        self.0
-    }
-}
-
-async fn serve_responses(
-    response_bodies: Vec<String>,
-) -> (String, tokio::task::JoinHandle<Vec<String>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let task = tokio::spawn(async move {
-        let mut requests = Vec::with_capacity(response_bodies.len());
-        for response_body in response_bodies {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let header_end = loop {
-                let mut buffer = [0_u8; 1024];
-                let read = stream.read(&mut buffer).await.unwrap();
-                assert!(read > 0, "client disconnected before sending headers");
-                request.extend_from_slice(&buffer[..read]);
-                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                    break index + 4;
-                }
-            };
-            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .map(str::trim)
-                        .map(str::parse::<usize>)
-                })
-                .transpose()
-                .unwrap()
-                .unwrap_or(0);
-            while request.len() - header_end < content_length {
-                let mut buffer = [0_u8; 1024];
-                let read = stream.read(&mut buffer).await.unwrap();
-                assert!(read > 0, "client disconnected before sending its body");
-                request.extend_from_slice(&buffer[..read]);
-            }
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                response_body.len(),
-                response_body
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-            requests.push(String::from_utf8(request).unwrap());
-        }
-        requests
-    });
-    (format!("http://{address}"), task)
-}
-
-async fn serve_once(response_body: &str) -> (String, tokio::task::JoinHandle<String>) {
-    let (base_url, requests) = serve_responses(vec![response_body.to_string()]).await;
-    let request = tokio::spawn(async move { requests.await.unwrap().pop().unwrap() });
-    (base_url, request)
-}
 
 fn canonical_order(order_id: i64, reduce_only: bool) -> serde_json::Value {
     serde_json::json!({
@@ -127,7 +58,7 @@ async fn typed_all_orders_uses_returned_pagination_without_requesting_a_limit() 
         orders_page(vec![canonical_order(1, false)], 1, 5),
         orders_page(Vec::new(), 1, 6),
     ];
-    let (base_url, requests) = serve_responses(responses).await;
+    let (base_url, requests) = serve_sequence(responses).await;
     let client = HypercallClient::new(&base_url);
 
     let orders = client
@@ -149,7 +80,7 @@ async fn raw_all_orders_uses_returned_pagination_without_requesting_a_limit() {
         orders_page(vec![canonical_order(1, false)], 1, 0),
         orders_page(Vec::new(), 1, 1),
     ];
-    let (base_url, requests) = serve_responses(responses).await;
+    let (base_url, requests) = serve_sequence(responses).await;
     let client = HypercallClient::new(&base_url);
 
     let orders = client
@@ -210,8 +141,7 @@ async fn place_request_uses_explicit_nonce_client_id_and_signed_action_path() {
     assert_eq!(result.stage, hypercall_sdk_types::DirectiveStage::Enqueued);
     let request = request_task.await.unwrap();
     assert!(request.starts_with("POST /v1/actions/hl_limit_order HTTP/1.1\r\n"));
-    let body = request.split("\r\n\r\n").nth(1).unwrap();
-    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    let body = json_body(&request);
     assert_eq!(body["nonce"], 777);
     assert_eq!(body["action"]["asset"], 3);
     assert_eq!(body["action"]["limitPx"], 1_234_567_890_u64);
@@ -245,8 +175,7 @@ async fn set_account_abstraction_uses_manager_signed_unified_action_path() {
     assert_eq!(result.stage, hypercall_sdk_types::DirectiveStage::Submitted);
     let request = request_task.await.unwrap();
     assert!(request.starts_with("POST /v1/actions/hl_set_abstraction HTTP/1.1\r\n"));
-    let body: serde_json::Value =
-        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let body = json_body(&request);
     assert_eq!(body["account"], ACCOUNT);
     assert_eq!(body["nonce"], 778);
     assert_eq!(body["action"]["user"], ACCOUNT);
@@ -281,8 +210,7 @@ async fn update_api_wallet_uses_manager_signed_hypercall_action_path() {
     assert_eq!(result.stage, hypercall_sdk_types::DirectiveStage::Submitted);
     let request = request_task.await.unwrap();
     assert!(request.starts_with("POST /v1/actions/hc_update_api_wallet HTTP/1.1\r\n"));
-    let body: serde_json::Value =
-        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let body = json_body(&request);
     assert_eq!(body["account"], ACCOUNT);
     assert_eq!(body["nonce"], 779);
     assert_eq!(body["action"]["name"], format!("{name:#x}"));
@@ -323,8 +251,7 @@ async fn place_request_uses_signer_nonce_for_default_client_id() {
     assert_eq!(result.stage, hypercall_sdk_types::DirectiveStage::Rejected);
     assert_eq!(result.rejection.unwrap().code, "risk_rejected");
     let request = request_task.await.unwrap();
-    let body: serde_json::Value =
-        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let body = json_body(&request);
     assert_eq!(body["action"]["cloid"], body["nonce"]);
 }
 
@@ -370,8 +297,7 @@ async fn cancellation_requests_use_native_oid_and_cloid_paths() {
         .unwrap();
     let request = request_task.await.unwrap();
     assert!(request.starts_with("POST /v1/actions/hl_cancel_by_oid HTTP/1.1\r\n"));
-    let body: serde_json::Value =
-        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let body = json_body(&request);
     assert_eq!(body["action"]["oid"], "9007199254740992");
 
     let cloid_response = format!(
@@ -392,8 +318,7 @@ async fn cancellation_requests_use_native_oid_and_cloid_paths() {
         .unwrap();
     let request = request_task.await.unwrap();
     assert!(request.starts_with("POST /v1/actions/hl_cancel_by_cloid HTTP/1.1\r\n"));
-    let body: serde_json::Value =
-        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let body = json_body(&request);
     assert_eq!(body["action"]["cloid"], u128::MAX.to_string());
 }
 
@@ -487,7 +412,7 @@ async fn canonical_reads_decode_pm_positions_and_typed_order_fill_pages() {
         "pagination": {"limit": 20, "offset": 0, "count": 1}
     })
     .to_string();
-    let (base_url, requests) = serve_responses(vec![portfolio, orders, fills]).await;
+    let (base_url, requests) = serve_sequence(vec![portfolio, orders, fills]).await;
     let client = HypercallClient::new(&base_url);
     let account: AccountAddress = ACCOUNT.parse().unwrap();
 

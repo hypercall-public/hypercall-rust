@@ -2,14 +2,13 @@
 //!
 //! This crate intentionally contains protocol-shaped data only.
 
+pub mod channel;
 pub mod client;
 pub mod qp;
 pub mod recovery;
 
-pub use client::{
-    ClientControlMessage, GatewayErrorCode, GatewayStatus, GatewayStatusMessage,
-    UnsupportedWriteKind,
-};
+pub use channel::{WsChannel, RETIRED_CHANNELS, UNKNOWN_CHANNEL_CODE};
+pub use client::{ClientControlMessage, GatewayErrorCode, GatewayStatus, GatewayStatusMessage};
 pub use qp::{
     BorrowedIndicativeQuote, BorrowedIndicativeQuoteUpdate, BorrowedScopedIndicativeQuoteUpdate,
     GatewayResumeQuoteProvider, IndicativeQuote, QpClientMessage, QpInboundMessage,

@@ -127,7 +127,8 @@ pub struct Position {
     pub amount: Decimal,
     /// Volume-weighted average entry price in USD. Serialized as a string.
     pub entry_price: Decimal,
-    /// Margin currently locked against this position in USD. Serialized as a string.
+    /// In Standard Margin, standalone IM before expiry-group relief; this is
+    /// diagnostic, not an additive allocation of the portfolio requirement.
     pub margin_posted: Decimal,
     /// Cumulative realized PnL in USD. Serialized as a string.
     pub realized_pnl: Decimal,
@@ -147,11 +148,15 @@ pub struct PositionWithMetrics {
     pub instrument_type: String,
     /// Dollar notional value of the position. Serialized as a string.
     pub notional_value: Decimal,
-    /// Maintenance margin requirement in USD. Serialized as a string.
+    /// Standalone MM diagnostic in Standard Margin, before expiry-group relief.
+    /// Portfolio requirements are in margin_summary, not the sum of these rows.
     pub maintenance_margin: Decimal,
-    /// Estimated liquidation price in USD. Serialized as a string.
-    pub liquidation_price: Decimal,
-    /// Margin utilization ratio (margin_used / equity). Serialized as a string.
+    /// Display-only liquidation estimate in USD. Standard options return null
+    /// because liquidation depends on the complete expiry portfolio.
+    pub liquidation_price: Option<Decimal>,
+    /// Position-level diagnostic: margin_posted / abs(notional_value), or zero
+    /// when notional is zero. Account utilization is in margin_summary.
+    /// Serialized as a string.
     pub margin_ratio: Decimal,
 }
 
@@ -214,7 +219,9 @@ pub struct Portfolio {
     pub total_margin_used: Decimal,
     /// Free collateral available for new trades in USD. Serialized as a string.
     pub available_balance: Decimal,
-    /// Account.sol USDC currently eligible for a direct PM withdrawal.
+    /// Reservation-netted Account.sol USDC capped by Hypercall
+    /// withdrawal-admission margin headroom, then truncated toward zero to
+    /// eight decimal places.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub withdrawable_usdc: Option<Decimal>,
     /// Source timestamp of the authoritative Hydromancer portfolio snapshot.
@@ -315,6 +322,8 @@ pub struct UnderlyingRiskGridResponse {
 /// Top-level SPAN risk grid response for an account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskGridResponse {
+    /// Canonical Hypercall account resolved from the requested manager or account.
+    pub wallet: WalletAddress,
     /// Total account equity in USD. Serialized as a string.
     pub equity: Decimal,
     /// Initial margin for existing positions in USD. Serialized as a string.
@@ -1045,6 +1054,7 @@ mod tests {
     #[test]
     fn risk_grid_serializes_only_per_underlying_matrices() {
         let response = RiskGridResponse {
+            wallet: WalletAddress::default(),
             equity: dec!(100),
             position_initial_margin: dec!(10),
             position_maintenance_margin: dec!(5),
@@ -1080,6 +1090,7 @@ mod tests {
         };
 
         let json = serde_json::to_value(response).expect("risk grid should serialize");
+        assert_eq!(json["wallet"], "0x0000000000000000000000000000000000000000");
         assert_eq!(json["underlyings"][0]["underlying"], "BTC");
         assert_eq!(json["underlyings"][1]["underlying"], "AAPL");
         assert!(json.get("scenarios").is_none());
@@ -1154,7 +1165,7 @@ mod tests {
             instrument_type: "option".to_string(),
             notional_value: dec!(-450),
             maintenance_margin: dec!(0),
-            liquidation_price: dec!(0),
+            liquidation_price: None,
             margin_ratio: dec!(0),
         };
         let json = serde_json::to_value(&pwm).unwrap();
@@ -1163,6 +1174,7 @@ mod tests {
         assert_eq!(json["amount"], "-3");
         // PositionWithMetrics fields also at top level
         assert_eq!(json["notional_value"], "-450");
+        assert!(json["liquidation_price"].is_null());
         // No nested "position" key
         assert!(json.get("position").is_none());
     }
@@ -1521,6 +1533,8 @@ mod tests {
 pub struct ExchangeInfoResponse {
     /// Exchange contract address on HyperEVM (deposit destination).
     pub exchange_address: String,
+    /// Factory contract used to create portfolio-margin accounts.
+    pub factory_address: String,
     /// Router used for direct Account.sol deposits when PM deposits are enabled.
     pub deposit_router_address: Option<String>,
     /// Whether direct portfolio-margin deposits are enabled in this environment.
@@ -1529,6 +1543,10 @@ pub struct ExchangeInfoResponse {
     pub chain_id: u64,
     /// EIP-712 signing domain info.
     pub signing_domain: SigningDomainInfo,
+    /// Zero-fee Hypercall builder attached to every TEE perp order. Mainnet
+    /// rejects those orders until the Account approves this builder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hl_builder_address: Option<String>,
 }
 
 /// EIP-712 domain parameters for frontend signing.
@@ -1538,4 +1556,6 @@ pub struct SigningDomainInfo {
     pub name: String,
     /// Domain version ("1").
     pub version: String,
+    /// Contract address used by the EIP-712 domain.
+    pub verifying_contract: String,
 }

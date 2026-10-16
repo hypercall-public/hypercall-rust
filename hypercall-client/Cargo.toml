@@ -1,6 +1,6 @@
 [package]
 name = "hypercall-client"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Client library for interacting with Hypercall trading platform"
 readme = "README.md"
@@ -9,31 +9,56 @@ homepage = "https://github.com/hypercall-public"
 documentation = "https://docs.rs/hypercall-client"
 keywords = ["hypercall", "trading", "options", "sdk"]
 categories = ["api-bindings", "web-programming::websocket"]
-include = ["Cargo.toml", "README.md", "src/**"]
+include = ["Cargo.toml", "README.md", "src/**", "examples/rfq_v2_*.rs"]
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-machete]
+# Intentional transitive compatibility constraint for the optional AWS signer.
+ignored = ["aws-smithy-types"]
 
 [features]
-default = ["alloy-rustls"]
+default = ["alloy-rustls", "rfq-v2"]
 alloy-rustls = ["alloy/reqwest-rustls-tls", "reqwest/rustls-tls"]
 alloy-native-tls = ["alloy/reqwest-native-tls", "reqwest/native-tls"]
-kms = ["alloy/signer-aws"]
+kms = ["alloy/signer-aws", "dep:aws-smithy-types"]
 test-utils = []
+# RFQ V2 client: `rfq_v2`, `rfq_v2_recovery`, `rfq_v2_signing`, signed read
+# grants and the private `rfq_v2` WebSocket channel. On by default since 0.3.0.
+rfq-v2 = ["dep:base64", "hypercall-sdk-types/rfq-v2", "hypercall-ws-protocol/rfq-v2"]
 
 [dependencies]
+displaystr = "0.1.16"
+thiserror = "1"
 rust_decimal = { version = "1.39", features = ["serde-with-str"] }
 # Shared types
-hypercall-sdk-types = { path = "../hypercall-sdk-types", version = "0.1.0" }
-hypercall-ws-protocol = { path = "../hypercall-ws-protocol", version = "0.1.0" }
+hypercall-sdk-types = { path = "../hypercall-sdk-types", version = "0.3.0" }
+hypercall-ws-protocol = { path = "../hypercall-ws-protocol", version = "0.3.0" }
 
 # Alloy for signing and wallet operations
 alloy = { version = "1.0", default-features = false, features = ["contract", "provider-http", "network", "signer-local", "eip712", "reqwest"] }
+# Smithy 1.7 changes Document incompatibly with the released JSON codecs.
+# Remove after the AWS signer resolves compatible codecs in fresh SDK builds:
+# https://github.com/awslabs/aws-sdk-rust/issues/1459
+aws-smithy-types = { version = ">=1.5.0, <1.7.0", optional = true }
+# Bearer encoding for RFQ V2 read grants (`rfq-v2` feature only).
+base64 = { version = "0.22", optional = true }
 
 # HTTP client
-reqwest = { version = "0.11", default-features = false, features = ["json"] }
+# gzip: send Accept-Encoding: gzip and decode transparently. The public API
+# gzips responses at its edge (large reads such as /markets shrink ~7x).
+reqwest = { version = "0.11", default-features = false, features = ["json", "gzip"] }
 
 # Async runtime
-tokio = { version = "1", features = ["sync", "time"] }
+tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
 
-# WebSocket
+# WebSocket. No Tungstenite release implements RFC 7692 permessage-deflate,
+# so `WsClient` (/ws) negotiates it itself and inflates compressed frames
+# below Tungstenite with a bounded output size (src/websocket_deflate_io.rs).
+# TLS stays on native-tls and the platform trust store.
+flate2 = "1"
+tokio-native-tls = "0.3"
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 futures = "0.3"
 rand = "0.8"
@@ -50,6 +75,18 @@ sha3 = "0.10"
 uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
-hypercall-sdk-types = { path = "../hypercall-sdk-types", version = "0.1.0", features = ["test-utils"] }
+# RequestPacket and ResponsePacket are used only by crate-private HTTP fixtures.
+alloy = { version = "1.0", default-features = false, features = ["json-rpc"] }
+hypercall-sdk-types = { path = "../hypercall-sdk-types", version = "0.3.0", features = ["test-utils"] }
 tokio = { version = "1", features = ["full"] }
 rust_decimal_macros = "1.35"
+proptest = "1.0"
+tower = "0.5"
+
+[[example]]
+name = "rfq_v2_taker"
+required-features = ["rfq-v2"]
+
+[[example]]
+name = "rfq_v2_maker"
+required-features = ["rfq-v2"]

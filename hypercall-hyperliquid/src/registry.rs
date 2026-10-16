@@ -62,10 +62,10 @@ impl HyperliquidPerpAssetRegistry {
     }
 
     async fn from_hyperliquid_client_metadata(client: HttpClient) -> Result<Self> {
-        let markets = client.perps().await.map_err(|error| ClientError::Api {
-            status: 400,
-            message: error.to_string(),
-        })?;
+        let markets = client
+            .perps()
+            .await
+            .map_err(|source| ClientError::api_source(400, crate::HypersdkReport(source)))?;
         Ok(Self::from_markets(markets))
     }
 

@@ -54,6 +54,9 @@ pub struct MarginSnapshot {
     pub initial_margin_required: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
     pub maintenance_margin_required: Decimal,
+    /// Authoritative maintenance headroom; SM cannot derive this from NAV.
+    #[serde(with = "rust_decimal::serde::str")]
+    pub maintenance_margin: Decimal,
 }
 
 impl MarginSnapshot {
@@ -62,7 +65,7 @@ impl MarginSnapshot {
     }
 
     pub fn maintenance_excess(&self) -> Decimal {
-        self.equity - self.maintenance_margin_required
+        self.maintenance_margin
     }
 }
 

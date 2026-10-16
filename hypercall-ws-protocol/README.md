@@ -21,6 +21,11 @@ Most trading integrations should use `hypercall-client`. Depend on this crate
 directly only when you need to serialize or inspect WebSocket messages without
 the client runtime.
 
+## Features
+
+- `rfq-v2` (default): private `rfq_v2` channel (`WsChannel::RfqV2`). See the
+  `hypercall-client` README.
+
 ## Compatibility
 
 Serde field names and enum variants are part of the public wire contract. Keep

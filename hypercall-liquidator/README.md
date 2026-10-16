@@ -6,6 +6,18 @@ Reference standard margin liquidator for Hypercall.
 This crate is intentionally conservative. It is a reference implementation for
 operators building their own liquidator, not a turnkey production service.
 
+## Unreleased options margin migration
+
+The portfolio reader requires the explicit Standard cash breakdown. It rejects
+older SM portfolio responses instead of deriving cash capacity from NAV. The
+CLI reads authoritative headroom from the existing liquidation-status bid terms.
+
+Library margin snapshots and candidates now require the `maintenance_margin`
+headroom field, including when deserializing saved JSON. Rebuild old snapshots
+from current authoritative responses. Do not infer that field from NAV or fill
+it with zero. Update Rust struct literals before upgrading the crate. See the
+[API migration guide](https://docs.hypercall.xyz/docs/trading/over-api/operations/changelog#no-new-release---september-2-2026).
+
 ## Getting Started
 
 Clone the public repository and validate the example config:

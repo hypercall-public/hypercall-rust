@@ -2,6 +2,10 @@
 //!
 //! [`HypercallClient`] provides typed methods for every REST endpoint:
 //! orders, markets, portfolio, margin mode, fills, and more.
+#![expect(
+    clippy::result_large_err,
+    reason = "these methods preserve the established unboxed public ClientError contract"
+)]
 //!
 //! # Example
 //!
@@ -34,7 +38,7 @@
 //!
 use std::time::Duration;
 
-use reqwest::{Client, Method, RequestBuilder};
+use reqwest::{redirect::Policy as RedirectPolicy, Client, Method, RequestBuilder};
 use rust_decimal::Decimal;
 use serde::Serialize;
 use sonic_rs::{json, JsonContainerTrait, JsonValueTrait, Value};
@@ -51,7 +55,7 @@ use hypercall_sdk_types::{
     WalletAddress,
 };
 
-use crate::error::{ClientError, Result};
+use crate::error::{ClientError, Result, RfqInputError};
 use crate::wallet::{
     AccountAddress, CancelOrderSignature, HypercallSigner, HypercallWallet, PlaceOrderSignature,
     ReplaceOrderSignature, StandardMarginLiquidationSignature,
@@ -222,6 +226,8 @@ pub struct BulkReplaceOrderParams<'a> {
 #[derive(Debug, Clone)]
 pub struct StandardMarginLiquidationParams {
     pub liquidated_wallet: AccountAddress,
+    /// Idempotency key for this bid. The API requires a UUIDv7 created
+    /// within the last hour (`Uuid::now_v7()`); reuse it only for retries.
     pub request_id: uuid::Uuid,
     pub auction_id: String,
     pub bid_usdc: String,
@@ -239,13 +245,25 @@ pub struct StandardMarginLiquidationParams {
 pub struct HypercallClient {
     client: Client,
     base_url: String,
+    /// Cached offset between this host's clock and the API server's clock,
+    /// shared by clones. TEE perp nonces are stamped on the server clock.
+    pub(crate) server_clock: crate::tee_perp::ServerClock,
 }
 
 impl HypercallClient {
-    /// Create a new API client.
+    /// Create a new API client. Requests time out after 30 seconds.
     pub fn new(base_url: impl Into<String>) -> Self {
+        Self::with_timeout(base_url, Duration::from_secs(30))
+    }
+
+    /// Create an API client whose requests time out after `timeout`. A
+    /// mutation that times out has an unknown outcome; with the `rfq-v2`
+    /// feature, RFQ V2 reports it as `ClientError::RfqV2SubmissionAmbiguous`
+    /// for reconciliation.
+    pub fn with_timeout(base_url: impl Into<String>, timeout: Duration) -> Self {
         let client = Client::builder()
-            .timeout(Duration::from_secs(30))
+            .redirect(RedirectPolicy::none())
+            .timeout(timeout)
             .user_agent("hypercall-client/0.1")
             .build()
             .expect("failed to build reqwest client");
@@ -253,6 +271,7 @@ impl HypercallClient {
         Self {
             client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            server_clock: crate::tee_perp::ServerClock::default(),
         }
     }
 
@@ -1586,9 +1605,11 @@ impl HypercallClient {
         legs: Vec<hypercall_sdk_types::RfqLegRequest>,
     ) -> Result<Value> {
         // Parse rfq_id to bytes for signing
-        let rfq_uuid = uuid::Uuid::parse_str(rfq_id).map_err(|e| ClientError::Api {
-            status: 0,
-            message: format!("Invalid rfq_id: {}", e),
+        let rfq_uuid = uuid::Uuid::parse_str(rfq_id).map_err(|source| {
+            ClientError::RfqInput(RfqInputError::InvalidUuid {
+                label: "Invalid rfq_id",
+                source,
+            })
         })?;
         let mut rfq_id_bytes = [0u8; 32];
         rfq_id_bytes[16..].copy_from_slice(rfq_uuid.as_bytes());
@@ -1628,9 +1649,11 @@ impl HypercallClient {
         legs: Vec<hypercall_sdk_types::RfqLegRequest>,
         limit_price: rust_decimal::Decimal,
     ) -> Result<Value> {
-        let rfq_uuid = uuid::Uuid::parse_str(rfq_id).map_err(|e| ClientError::Api {
-            status: 0,
-            message: format!("Invalid rfq_id: {}", e),
+        let rfq_uuid = uuid::Uuid::parse_str(rfq_id).map_err(|source| {
+            ClientError::RfqInput(RfqInputError::InvalidUuid {
+                label: "Invalid rfq_id",
+                source,
+            })
         })?;
         let mut rfq_id_bytes = [0u8; 32];
         rfq_id_bytes[16..].copy_from_slice(rfq_uuid.as_bytes());
@@ -1641,15 +1664,12 @@ impl HypercallClient {
         use rust_decimal::prelude::ToPrimitive;
         let limit_micro = (limit_price * Decimal::new(1_000_000, 0))
             .to_i64()
-            .ok_or_else(|| ClientError::Api {
-                status: 0,
-                message: "limit_price overflow in micro-unit conversion".to_string(),
-            })?;
-        let limit_i256 =
-            alloy::primitives::I256::try_from(limit_micro).map_err(|e| ClientError::Api {
-                status: 0,
-                message: format!("limit_price I256 conversion: {}", e),
-            })?;
+            .ok_or(ClientError::RfqInput(RfqInputError::LimitPriceOverflow))?;
+        let limit_i256 = alloy::primitives::I256::try_from(limit_micro).map_err(|source| {
+            ClientError::RfqInput(RfqInputError::LimitPriceConversion {
+                source: Box::new(source),
+            })
+        })?;
 
         let nonce = wallet.next_nonce();
         let signature = wallet
@@ -1681,13 +1701,17 @@ impl HypercallClient {
         quote_id: &str,
         net_premium: alloy::primitives::I256,
     ) -> Result<Value> {
-        let rfq_uuid = uuid::Uuid::parse_str(rfq_id).map_err(|e| ClientError::Api {
-            status: 0,
-            message: format!("Invalid rfq_id: {}", e),
+        let rfq_uuid = uuid::Uuid::parse_str(rfq_id).map_err(|source| {
+            ClientError::RfqInput(RfqInputError::InvalidUuid {
+                label: "Invalid rfq_id",
+                source,
+            })
         })?;
-        let quote_uuid = uuid::Uuid::parse_str(quote_id).map_err(|e| ClientError::Api {
-            status: 0,
-            message: format!("Invalid quote_id: {}", e),
+        let quote_uuid = uuid::Uuid::parse_str(quote_id).map_err(|source| {
+            ClientError::RfqInput(RfqInputError::InvalidUuid {
+                label: "Invalid quote_id",
+                source,
+            })
         })?;
         let mut rfq_id_bytes = [0u8; 32];
         rfq_id_bytes[16..].copy_from_slice(rfq_uuid.as_bytes());
@@ -1753,9 +1777,12 @@ fn compute_legs_hash(legs: &[hypercall_sdk_types::RfqLegRequest]) -> Result<[u8;
             let size_canonical = l
                 .size
                 .parse::<Decimal>()
-                .map_err(|e| ClientError::Api {
-                    status: 0,
-                    message: format!("Invalid leg size {:?}: {}", l.size, e),
+                .map_err(|source| {
+                    ClientError::RfqInput(RfqInputError::InvalidLegSize {
+                        label: "Invalid",
+                        value: l.size.clone(),
+                        source,
+                    })
                 })?
                 .to_string();
             Ok(format!("{}|{}|{}", l.instrument, side, size_canonical))
@@ -1809,8 +1836,21 @@ fn next_orders_page_offset(
 }
 
 #[cfg(test)]
+#[path = "api_redirect_test.rs"]
+mod redirect_tests;
+
+#[cfg(test)]
+#[path = "api_replace_order_test.rs"]
+mod replace_order_tests;
+
+#[cfg(test)]
+#[path = "api_compression_test.rs"]
+mod compression_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn test_client_new() {
         let client = HypercallClient::new("http://localhost:3000");

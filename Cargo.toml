@@ -7,3 +7,12 @@ members = [
     "hypercall-hyperliquid",
     "hypercall-liquidator",
 ]
+
+[workspace.lints.rust]
+warnings = { level = "deny", priority = -1 }
+unexpected_cfgs = { level = "deny", check-cfg = ['cfg(kani)'] }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"

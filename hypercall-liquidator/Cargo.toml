@@ -1,6 +1,6 @@
 [package]
 name = "hypercall-liquidator"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Public proof-of-concept standard margin liquidator with external Hyperliquid hedge planning"
 readme = "README.md"
@@ -10,6 +10,9 @@ documentation = "https://docs.rs/hypercall-liquidator"
 keywords = ["hypercall", "liquidation", "trading", "sdk"]
 categories = ["command-line-utilities"]
 include = ["Cargo.toml", "README.md", "src/**", "examples/**"]
+
+[lints]
+workspace = true
 
 [features]
 default = ["ui", "rustls"]
@@ -23,15 +26,16 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 hex = "0.4"
-hypercall-client = { path = "../hypercall-client", version = "0.1.0", default-features = false }
-hypercall-hyperliquid = { path = "../hypercall-hyperliquid", version = "0.1.0" }
-hypercall-sdk-types = { path = "../hypercall-sdk-types", version = "0.1.0" }
+hypercall-client = { path = "../hypercall-client", version = "0.3.0", default-features = false }
+hypercall-hyperliquid = { path = "../hypercall-hyperliquid", version = "0.3.0" }
+hypercall-sdk-types = { path = "../hypercall-sdk-types", version = "0.3.0" }
 leptos = { version = "0.7", optional = true }
 rust_decimal = { version = "1", features = ["serde-with-str"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "1"
+displaystr = "0.1.16"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 toml = "0.8"
 uuid = "1"

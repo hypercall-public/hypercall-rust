@@ -39,7 +39,7 @@ where
     deserializer.deserialize_str(StringDecimalVisitor)
 }
 
-/// Deserialize an optional string as Option<Decimal>.
+/// Deserialize an optional string as `Option<Decimal>`.
 /// The API always returns Decimal values as JSON strings (e.g., "0.5", "10000").
 fn option_string_decimal<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
 where
@@ -89,6 +89,50 @@ pub struct ApiResponse<T> {
     pub data: Option<T>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// Domain processing state returned by the USDC withdrawal acceptance routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsdcWithdrawalDomainStatus {
+    Pending,
+    Accepted,
+    Confirmed,
+    Rejected,
+    PendingChainEffect,
+    PendingManualReview,
+    Completed,
+    Failed,
+}
+
+/// Accepted Standard Margin USDC withdrawal.
+///
+/// Acceptance means the withdrawal is queued for delivery. Callers should
+/// poll the returned `directive_id` until it reaches a terminal delivery state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StandardUsdcWithdrawalResponse {
+    pub success: bool,
+    pub request_id: String,
+    pub directive_id: String,
+    pub domain_status: UsdcWithdrawalDomainStatus,
+    pub delivery_status: crate::DirectiveDeliveryStatus,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub balance_after: Decimal,
+    pub message: String,
+}
+
+/// Accepted Portfolio Margin USDC withdrawal.
+///
+/// Acceptance means the withdrawal is queued for delivery. Callers should
+/// poll the returned `directive_id` until it reaches a terminal delivery state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortfolioUsdcWithdrawalResponse {
+    pub success: bool,
+    pub request_id: String,
+    pub directive_id: String,
+    pub domain_status: UsdcWithdrawalDomainStatus,
+    pub delivery_status: crate::DirectiveDeliveryStatus,
+    pub message: String,
 }
 
 impl<T> ApiResponse<T> {
@@ -978,6 +1022,70 @@ pub struct HistoricalTheoResponse {
 // Portfolio Response Types
 // =============================================================================
 
+/// Standard Margin cash basis and compatible-expiry portfolio relief.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct StandardMarginBreakdown {
+    /// USDC cash before requirements and open BUY premium reservations; excludes option marks.
+    #[serde(deserialize_with = "string_decimal")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub cash_margin: Decimal,
+    /// Authoritative SM cash headroom after position IM, open-order IM, and reserved premiums.
+    #[serde(deserialize_with = "string_decimal")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub initial_margin_headroom: Decimal,
+    /// Authoritative SM cash headroom after position MM. Negative means a maintenance breach.
+    #[serde(deserialize_with = "string_decimal")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub maintenance_margin_headroom: Decimal,
+    /// Option oracle contingency added after group relief.
+    #[serde(deserialize_with = "string_decimal")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub oracle_contingency_im: Decimal,
+    /// Quote depeg contingency added after group relief.
+    #[serde(deserialize_with = "string_decimal")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub quote_depeg_im: Decimal,
+    /// Requirements are combined within each compatible underlying and expiry.
+    pub option_groups: Vec<StandardOptionExpiryMargin>,
+}
+
+/// A complete expiry group, rather than additive per-position attribution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct StandardOptionExpiryMargin {
+    pub underlying: String,
+    /// Expiry in Unix seconds.
+    pub expiry_ts: i64,
+    pub symbols: Vec<String>,
+    #[serde(deserialize_with = "string_decimal")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub isolated_im: Decimal,
+    #[serde(deserialize_with = "string_decimal")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub isolated_mm: Decimal,
+    /// Finite-grid settlement obligation before unmatched call-tail charges.
+    #[serde(deserialize_with = "string_decimal")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub payoff_cash_requirement: Decimal,
+    /// None means the call tail is unbounded, not that its maximum loss is zero.
+    #[serde(deserialize_with = "option_string_decimal")]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    pub bounded_max_loss: Option<Decimal>,
+    #[serde(deserialize_with = "string_decimal")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub unpaired_call_im: Decimal,
+    #[serde(deserialize_with = "string_decimal")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub unpaired_call_mm: Decimal,
+    #[serde(deserialize_with = "string_decimal")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub initial_margin: Decimal,
+    #[serde(deserialize_with = "string_decimal")]
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub maintenance_margin: Decimal,
+}
+
 /// Unified margin summary that works for both Standard and Portfolio modes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -996,11 +1104,11 @@ pub struct MarginSummary {
     #[serde(deserialize_with = "string_decimal")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub open_orders_im: Decimal,
-    /// Excess Initial Margin (equity - position_im - open_orders_im)
+    /// NAV minus position IM, open-order IM, and SM reserved premiums. For SM admission use standard_margin.initial_margin_headroom.
     #[serde(deserialize_with = "string_decimal")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub initial_margin: Decimal,
-    /// Excess Maintenance Margin (equity - position_mm)
+    /// NAV minus position MM. For SM liquidation use standard_margin.maintenance_margin_headroom.
     #[serde(deserialize_with = "string_decimal")]
     #[cfg_attr(feature = "schemars", schemars(with = "String"))]
     pub maintenance_margin: Decimal,
@@ -1012,24 +1120,70 @@ pub struct MarginSummary {
     )]
     #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub open_orders_premium_reserved: Option<Decimal>,
+    /// Present for Standard Margin; absent for Portfolio Margin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standard_margin: Option<StandardMarginBreakdown>,
 }
 
 impl MarginSummary {
-    /// Calculate the maintenance margin required (position_mm).
-    /// Since the API returns excess MM (equity - position_mm), we derive position_mm.
+    /// Preserve the public NAV-derived requirement accessor for existing clients.
+    /// SM admission and liquidation must use the explicit cash headroom accessors.
     pub fn maintenance_margin_required(&self) -> Decimal {
-        // maintenance_margin = equity - position_mm
-        // Therefore: position_mm = equity - maintenance_margin
         (self.equity - self.maintenance_margin).max(Decimal::ZERO)
     }
 
-    /// Calculate margin utilization (0-1 scale).
-    /// Returns the ratio of maintenance margin required to equity.
+    /// Legacy NAV utilization, retained for source and response compatibility.
+    /// Use `risk_margin_utilization` for mode-aware margin capacity.
     pub fn margin_utilization(&self) -> Decimal {
         if self.equity <= Decimal::ZERO {
             return Decimal::ONE;
         }
         (self.maintenance_margin_required() / self.equity).min(Decimal::ONE)
+    }
+
+    /// Cash capacity in SM and marked equity in PM. Missing SM data is unavailable.
+    pub fn maintenance_margin_basis(&self) -> Option<Decimal> {
+        match self.mode.as_str() {
+            "standard" => Some(self.standard_margin.as_ref()?.cash_margin),
+            "portfolio" => Some(self.equity),
+            _ => None,
+        }
+    }
+
+    /// Authoritative admission headroom after all order and premium reservations.
+    pub fn initial_margin_headroom(&self) -> Option<Decimal> {
+        match self.mode.as_str() {
+            "standard" => Some(self.standard_margin.as_ref()?.initial_margin_headroom),
+            "portfolio" => Some(self.initial_margin),
+            _ => None,
+        }
+    }
+
+    /// Authoritative liquidation headroom; long-option NAV cannot support SM.
+    pub fn maintenance_margin_headroom(&self) -> Option<Decimal> {
+        match self.mode.as_str() {
+            "standard" => Some(self.standard_margin.as_ref()?.maintenance_margin_headroom),
+            "portfolio" => Some(self.maintenance_margin),
+            _ => None,
+        }
+    }
+
+    /// Mode-aware MM requirement, unavailable when authoritative SM inputs are absent.
+    pub fn risk_maintenance_margin_required(&self) -> Option<Decimal> {
+        self.maintenance_margin_basis()?
+            .checked_sub(self.maintenance_margin_headroom()?)
+            .map(|required| required.max(Decimal::ZERO))
+    }
+
+    /// Maintenance utilization against the funds that actually support margin.
+    pub fn risk_margin_utilization(&self) -> Option<Decimal> {
+        let basis = self.maintenance_margin_basis()?;
+        if basis <= Decimal::ZERO {
+            return Some(Decimal::ONE);
+        }
+        self.risk_maintenance_margin_required()?
+            .checked_div(basis)
+            .map(|utilization| utilization.min(Decimal::ONE))
     }
 }
 
@@ -1046,7 +1200,8 @@ pub struct PortfolioPosition {
     /// Average entry price
     #[serde(deserialize_with = "string_decimal")]
     pub entry_price: Decimal,
-    /// Margin posted for this position
+    /// Standalone diagnostic before expiry-group relief in Standard Margin.
+    /// Not additive portfolio attribution; use margin_summary.standard_margin.
     #[serde(deserialize_with = "string_decimal")]
     pub margin_posted: Decimal,
     /// Realized profit/loss from closed positions
@@ -1061,9 +1216,9 @@ pub struct PortfolioPosition {
     /// Required maintenance margin (deprecated, use portfolio-level margin)
     #[serde(default, deserialize_with = "option_string_decimal_default")]
     pub maintenance_margin: Decimal,
-    /// Liquidation price (deprecated, use portfolio-level SPAN)
-    #[serde(default, deserialize_with = "option_string_decimal_default")]
-    pub liquidation_price: Decimal,
+    /// Display liquidation estimate; None for Standard options because risk is grouped.
+    #[serde(default, deserialize_with = "option_string_decimal")]
+    pub liquidation_price: Option<Decimal>,
     /// Current margin ratio
     #[serde(default, deserialize_with = "option_string_decimal_default")]
     pub margin_ratio: Decimal,
@@ -1083,7 +1238,9 @@ pub struct PortfolioResponse {
     /// Available balance for new positions
     #[serde(deserialize_with = "string_decimal")]
     pub available_balance: Decimal,
-    /// Account.sol USDC currently eligible for a direct PM withdrawal.
+    /// Reservation-netted Account.sol USDC capped by Hypercall
+    /// withdrawal-admission margin headroom, then truncated toward zero to
+    /// eight decimal places.
     #[serde(default, deserialize_with = "option_string_decimal")]
     pub withdrawable_usdc: Option<Decimal>,
     /// Source timestamp of the authoritative Hydromancer portfolio snapshot.
@@ -1192,6 +1349,10 @@ pub struct RfqQuoteLegResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RfqQuoteResponse {
     pub quote_id: String,
+    /// Provider signing identity, distinct from its canonical trading account.
+    pub qp_wallet: WalletAddress,
+    /// Canonical Hypercall account that will take the other side of this quote.
+    pub qp_account_wallet: WalletAddress,
     pub net_premium: Decimal,
     pub legs: Vec<RfqQuoteLegResponse>,
     pub expires_at: u64,
@@ -1238,3 +1399,7 @@ pub struct RfqHistoryResponse {
 pub use crate::api_models::Instrument;
 pub use crate::api_models::MarketInfo;
 pub use crate::api_models::MarketsResponse;
+
+#[cfg(test)]
+#[path = "responses_test.rs"]
+mod tests;

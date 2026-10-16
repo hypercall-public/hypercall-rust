@@ -1,12 +1,17 @@
 //! Managed Account.sol creation through the Hypercall Factory contract.
 
+#![expect(
+    clippy::result_large_err,
+    reason = "these helpers preserve the established unboxed public ClientError contract"
+)]
+
 use alloy::primitives::{aliases::U96, Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::sol;
 
 use crate::api::HypercallClient;
 use crate::error::{ClientError, Result};
-use crate::wallet::{AccountAddress, HypercallWallet};
+use crate::wallet::{evm_submission_lock, AccountAddress, HypercallWallet};
 
 const BPS_DENOMINATOR: u64 = 10_000;
 const CREATION_DEPOSIT_BUFFER_BPS: u64 = 100;
@@ -55,9 +60,10 @@ impl HypercallClient {
         manager: &HypercallWallet,
         params: CreateAccountParams,
     ) -> Result<CreateAccountResult> {
-        let rpc_url = params.rpc_url.parse().map_err(|error| {
-            ClientError::InvalidInput(format!("invalid HyperEVM RPC URL: {error}"))
-        })?;
+        let rpc_url = params
+            .rpc_url
+            .parse()
+            .map_err(|source| ClientError::invalid_input("HyperEVM RPC URL", source))?;
         let salt = validate_salt(params.salt)?;
         let factory_address = params.factory_address.as_wallet_address().inner();
         let provider = ProviderBuilder::new()
@@ -70,6 +76,8 @@ impl HypercallClient {
             .map_err(|error| onchain_error("read HyperEVM chain ID", error))?;
         validate_chain_id(rpc_chain_id, manager.chain_id())?;
 
+        let submission_lock = evm_submission_lock(manager.address.as_wallet_address().inner());
+        let _submission_guard = submission_lock.lock().await;
         create_account_on_provider(&provider, manager.address, factory_address, salt).await
     }
 }
@@ -120,9 +128,10 @@ where
         .map_err(|error| onchain_error("confirm Factory account creation", error))?;
 
     if !receipt.status() {
-        return Err(ClientError::Other(
-            "Factory account creation transaction reverted".to_string(),
-        ));
+        return Err(ClientError::TransactionReverted {
+            operation: "Factory account creation",
+            transaction_hash: Some(receipt.transaction_hash),
+        });
     }
 
     let event = receipt
@@ -157,20 +166,18 @@ fn validate_account_created_event(
     manager_address: Address,
     predicted_account: Address,
 ) -> Result<AccountAddress> {
-    let event = event.ok_or_else(|| {
-        ClientError::Other("confirmed Factory transaction did not emit AccountCreated".to_string())
-    })?;
+    let event = event.ok_or(ClientError::MissingAccountCreatedEvent)?;
     if event.manager != manager_address {
-        return Err(ClientError::Other(format!(
-            "AccountCreated manager {} does not match submitting manager {}",
-            event.manager, manager_address
-        )));
+        return Err(ClientError::AccountCreatedManagerMismatch {
+            observed: event.manager,
+            expected: manager_address,
+        });
     }
     if event.account != predicted_account {
-        return Err(ClientError::Other(format!(
-            "AccountCreated account {} does not match simulated account {}",
-            event.account, predicted_account
-        )));
+        return Err(ClientError::AccountCreatedAddressMismatch {
+            observed: event.account,
+            expected: predicted_account,
+        });
     }
     Ok(AccountAddress::from(event.account))
 }
@@ -191,7 +198,9 @@ fn buffered_u256(value: U256, buffer_bps: u64) -> Result<U256> {
         .checked_mul(multiplier)
         .and_then(|scaled| scaled.checked_add(U256::from(BPS_DENOMINATOR - 1)))
         .map(|rounded| rounded / U256::from(BPS_DENOMINATOR))
-        .ok_or_else(|| ClientError::Other("account creation deposit buffer overflow".to_string()))
+        .ok_or(ClientError::ArithmeticOverflow {
+            operation: "account creation deposit buffer",
+        })
 }
 
 fn buffered_u64(value: u64, buffer_bps: u64) -> Result<u64> {
@@ -199,13 +208,22 @@ fn buffered_u64(value: u64, buffer_bps: u64) -> Result<u64> {
         .checked_mul(u128::from(BPS_DENOMINATOR + buffer_bps))
         .and_then(|scaled| scaled.checked_add(u128::from(BPS_DENOMINATOR - 1)))
         .map(|scaled| scaled / u128::from(BPS_DENOMINATOR))
-        .ok_or_else(|| ClientError::Other("account creation gas buffer overflow".to_string()))?;
-    u64::try_from(rounded)
-        .map_err(|_| ClientError::Other("account creation gas buffer overflow".to_string()))
+        .ok_or(ClientError::ArithmeticOverflow {
+            operation: "account creation gas buffer",
+        })?;
+    u64::try_from(rounded).map_err(|_| ClientError::ArithmeticOverflow {
+        operation: "account creation gas buffer",
+    })
 }
 
-fn onchain_error(context: &str, error: impl std::fmt::Display) -> ClientError {
-    ClientError::Other(format!("failed to {context}: {error}"))
+fn onchain_error(
+    operation: impl Into<String>,
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> ClientError {
+    ClientError::Onchain {
+        operation: operation.into(),
+        source: Box::new(source),
+    }
 }
 
 #[cfg(test)]

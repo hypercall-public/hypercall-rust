@@ -1,7 +1,7 @@
-# Hypercall Rust Crates
+# Hypercall Public SDK Packages
 
-Public Rust crates for Hypercall API, WebSocket, signing, Hyperliquid hedging,
-and standard margin liquidation integrations.
+Public SDK packages for Hypercall API, WebSocket, signing, Hyperliquid hedging,
+standard margin liquidation, and physically settled covered-call integrations.
 
 ## Getting Started
 
@@ -18,7 +18,7 @@ available:
 
 ```toml
 [dependencies]
-hypercall-client = { git = "https://github.com/hypercall-public/hypercall-rust", tag = "v0.1.0" }
+hypercall-client = { git = "https://github.com/hypercall-public/hypercall-rust", tag = "v0.3.0" }
 ```
 
 Then create a production API client:
@@ -38,7 +38,11 @@ async fn main() -> hypercall_client::Result<()> {
 
 ## Packages
 
-- `hypercall-client`: API, WebSocket, wallet, RFQ, and perp helper client.
+- `hypercall-covered-call-maker-sdk`: Rust client for policy-validating, signing, and
+  submitting standalone covered-call RFQs, plus constructing explicit manual
+  exercise actions.
+- `hypercall-client`: API, WebSocket, wallet, RFQ (V1 and V2), and perp
+  helper client.
 - `hypercall-hyperliquid`: Direct Hyperliquid implementation of the public perp
   venue trait.
 - `hypercall-liquidator`: Reference standard margin liquidator.
@@ -59,6 +63,7 @@ Run focused checks before publishing package changes:
 
 ```bash
 cargo test -p hypercall-client
+cargo test -p hypercall-covered-call-maker-sdk
 cargo test -p hypercall-hyperliquid
 cargo test -p hypercall-liquidator
 cargo test -p hypercall-sdk-types
