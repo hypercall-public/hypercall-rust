@@ -32,9 +32,9 @@ pub enum SkipReason {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
+#[displaystr::display]
 pub enum CandidateEvaluationError {
-    #[error("liquidation max_bid_usdc must be positive")]
-    NonPositiveMaxBid,
+    NonPositiveMaxBid = "liquidation max_bid_usdc must be positive",
 }
 
 pub fn evaluate_candidate(
@@ -109,6 +109,7 @@ mod tests {
                 equity,
                 initial_margin_required: dec!(1500),
                 maintenance_margin_required: mm_required,
+                maintenance_margin: equity - mm_required,
             },
             current_bid_usdc: dec!(1000),
             positions: Vec::new(),

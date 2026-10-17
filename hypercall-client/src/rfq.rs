@@ -1,4 +1,8 @@
 //! High-level RFQ quote builder for Quote Providers.
+#![expect(
+    clippy::result_large_err,
+    reason = "the RFQ builder preserves the established unboxed public ClientError contract"
+)]
 //!
 //! Constructs valid, signed `RfqResponse` messages from an inbound
 //! `RfqRequest` and per-leg prices. The builder enforces the public RFQ
@@ -28,7 +32,7 @@
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
-use crate::error::{ClientError, Result};
+use crate::error::{ClientError, Result, RfqInputError};
 use crate::wallet::HypercallWallet;
 use hypercall_ws_protocol::{QpClientMessage, QpResponseLeg, QpRfqLeg};
 
@@ -53,20 +57,13 @@ pub async fn build_rfq_quote(
     wallet: &HypercallWallet,
 ) -> Result<QpClientMessage> {
     if legs.is_empty() {
-        return Err(ClientError::Api {
-            status: 0,
-            message: "RFQ has no legs".to_string(),
-        });
+        return Err(ClientError::RfqInput(RfqInputError::NoLegs));
     }
     if legs.len() != leg_prices.len() {
-        return Err(ClientError::Api {
-            status: 0,
-            message: format!(
-                "leg count mismatch: request has {} legs but {} prices provided",
-                legs.len(),
-                leg_prices.len()
-            ),
-        });
+        return Err(ClientError::RfqInput(RfqInputError::LegCountMismatch {
+            request_count: legs.len(),
+            price_count: leg_prices.len(),
+        }));
     }
 
     let mut response_legs = Vec::with_capacity(legs.len());
@@ -74,31 +71,34 @@ pub async fn build_rfq_quote(
 
     for (i, (leg, price)) in legs.iter().zip(leg_prices.iter()).enumerate() {
         if *price <= Decimal::ZERO {
-            return Err(ClientError::Api {
-                status: 0,
-                message: format!("leg {} price must be positive, got {}", i, price),
-            });
+            return Err(ClientError::RfqInput(RfqInputError::LegPriceNonPositive {
+                index: i,
+                price: *price,
+            }));
         }
 
-        let size: Decimal = leg.size.parse().map_err(|e| ClientError::Api {
-            status: 0,
-            message: format!("invalid leg size {:?}: {}", leg.size, e),
+        let size: Decimal = leg.size.parse().map_err(|source| {
+            ClientError::RfqInput(RfqInputError::InvalidLegSize {
+                label: "invalid",
+                value: leg.size.clone(),
+                source,
+            })
         })?;
         if size <= Decimal::ZERO {
-            return Err(ClientError::Api {
-                status: 0,
-                message: format!("leg {} size must be positive, got {}", i, size),
-            });
+            return Err(ClientError::RfqInput(RfqInputError::LegSizeNonPositive {
+                index: i,
+                size,
+            }));
         }
 
         match leg.side.to_lowercase().as_str() {
             "buy" => net_premium -= *price * size,
             "sell" => net_premium += *price * size,
             other => {
-                return Err(ClientError::Api {
-                    status: 0,
-                    message: format!("leg {} has invalid side: {:?}", i, other),
-                });
+                return Err(ClientError::RfqInput(RfqInputError::InvalidSide {
+                    index: i,
+                    side: other.to_owned(),
+                }));
             }
         }
 
@@ -113,23 +113,21 @@ pub async fn build_rfq_quote(
     let legs_hash = compute_qp_legs_hash(legs)?;
 
     let premium_scaled = net_premium * Decimal::new(1_000_000, 0);
-    let premium_micro = premium_scaled.to_i64().ok_or_else(|| ClientError::Api {
-        status: 0,
-        message: format!(
-            "net_premium {} not representable as micro-units i64",
-            net_premium
-        ),
+    let premium_micro = premium_scaled.to_i64().ok_or(ClientError::RfqInput(
+        RfqInputError::NetPremiumNotRepresentable { net_premium },
+    ))?;
+    let net_premium_i256 = alloy::primitives::I256::try_from(premium_micro).map_err(|source| {
+        ClientError::RfqInput(RfqInputError::NetPremiumConversion {
+            source: Box::new(source),
+        })
     })?;
-    let net_premium_i256 =
-        alloy::primitives::I256::try_from(premium_micro).map_err(|e| ClientError::Api {
-            status: 0,
-            message: format!("net_premium I256 conversion failed: {}", e),
-        })?;
     let valid_for_u256 = alloy::primitives::U256::from(valid_for_ms);
 
-    let rfq_uuid = uuid::Uuid::parse_str(rfq_id).map_err(|e| ClientError::Api {
-        status: 0,
-        message: format!("invalid rfq_id: {}", e),
+    let rfq_uuid = uuid::Uuid::parse_str(rfq_id).map_err(|source| {
+        ClientError::RfqInput(RfqInputError::InvalidUuid {
+            label: "invalid rfq_id",
+            source,
+        })
     })?;
     let mut rfq_id_bytes = [0u8; 32];
     rfq_id_bytes[16..].copy_from_slice(rfq_uuid.as_bytes());
@@ -177,9 +175,12 @@ fn compute_qp_legs_hash(legs: &[QpRfqLeg]) -> Result<[u8; 32]> {
             let size_canonical = l
                 .size
                 .parse::<Decimal>()
-                .map_err(|e| ClientError::Api {
-                    status: 0,
-                    message: format!("invalid leg size {:?}: {}", l.size, e),
+                .map_err(|source| {
+                    ClientError::RfqInput(RfqInputError::InvalidLegSize {
+                        label: "invalid",
+                        value: l.size.clone(),
+                        source,
+                    })
                 })?
                 .to_string();
             Ok(format!(
@@ -322,7 +323,15 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("positive"));
+        assert!(matches!(
+            &err,
+            ClientError::RfqInput(RfqInputError::LegPriceNonPositive { index: 0, price })
+                if *price == dec!(0)
+        ));
+        assert_eq!(
+            err.to_string(),
+            "API error (0): leg 0 price must be positive, got 0"
+        );
     }
 
     #[tokio::test]
@@ -338,7 +347,15 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("positive"));
+        assert!(matches!(
+            &err,
+            ClientError::RfqInput(RfqInputError::LegPriceNonPositive { index: 0, price })
+                if *price == dec!(-10)
+        ));
+        assert_eq!(
+            err.to_string(),
+            "API error (0): leg 0 price must be positive, got -10"
+        );
     }
 
     #[tokio::test]
@@ -357,7 +374,17 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("mismatch"));
+        assert!(matches!(
+            &err,
+            ClientError::RfqInput(RfqInputError::LegCountMismatch {
+                request_count: 2,
+                price_count: 1,
+            })
+        ));
+        assert_eq!(
+            err.to_string(),
+            "API error (0): leg count mismatch: request has 2 legs but 1 prices provided"
+        );
     }
 
     #[tokio::test]
@@ -373,7 +400,15 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("invalid side"));
+        assert!(matches!(
+            &err,
+            ClientError::RfqInput(RfqInputError::InvalidSide { index: 0, side })
+                if side == "long"
+        ));
+        assert_eq!(
+            err.to_string(),
+            "API error (0): leg 0 has invalid side: \"long\""
+        );
     }
 
     #[tokio::test]

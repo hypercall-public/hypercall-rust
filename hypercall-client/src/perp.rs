@@ -1,5 +1,10 @@
 //! Managed-account perp directive helpers.
 
+#![expect(
+    clippy::result_large_err,
+    reason = "these helpers preserve the established unboxed public ClientError contract"
+)]
+
 use alloy::primitives::B256;
 use hypercall_sdk_types::{
     DirectiveStatusResponse, DirectiveSubmitRequest, DirectiveSubmitResponse,
@@ -68,7 +73,7 @@ pub struct UpdateApiWalletParams {
     pub nonce: Option<u64>,
 }
 
-fn to_perp_units(value: Decimal, field: &str) -> Result<u64> {
+pub(crate) fn to_perp_units(value: Decimal, field: &str) -> Result<u64> {
     if value <= Decimal::ZERO {
         return Err(ClientError::InvalidInput(format!(
             "{field} must be positive"
@@ -240,8 +245,8 @@ impl HypercallClient {
         &self,
         directive_id: &str,
     ) -> Result<DirectiveStatusResponse> {
-        let directive_id = uuid::Uuid::parse_str(directive_id).map_err(|error| {
-            ClientError::InvalidInput(format!("invalid directive ID {directive_id}: {error}"))
+        let directive_id = uuid::Uuid::parse_str(directive_id).map_err(|source| {
+            ClientError::invalid_input(format!("directive ID {directive_id}"), source)
         })?;
         let route = format!("/v1/directives/{directive_id}");
         Self::send_reqwest_json(self.request(Method::GET, &route), "get directive status").await

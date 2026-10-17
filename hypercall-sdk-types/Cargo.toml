@@ -1,6 +1,6 @@
 [package]
 name = "hypercall-sdk-types"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Public SDK types for Hypercall clients"
 readme = "README.md"
@@ -11,8 +11,13 @@ keywords = ["hypercall", "trading", "options", "sdk"]
 categories = ["api-bindings", "data-structures"]
 include = ["Cargo.toml", "README.md", "src/**"]
 
+[lints]
+workspace = true
+
 [features]
-default = []
+default = ["rfq-v2"]
+# RFQ V2 types and WebSocket messages. On by default since 0.3.0.
+rfq-v2 = ["dep:displaystr"]
 asyncapi = ["dep:asyncapi-rust", "schemars"]
 schemars = ["dep:schemars"]
 test-utils = []
@@ -21,6 +26,7 @@ utoipa = ["dep:utoipa"]
 [dependencies]
 alloy = { version = "1.0", default-features = false }
 asyncapi-rust = { version = "0.2", optional = true }
+displaystr = { version = "0.1.16", optional = true }
 bitflags = "2"
 chrono = { version = "0.4", features = ["serde"] }
 rust_decimal = { version = "1.39", features = ["serde", "serde-with-str"] }
@@ -28,6 +34,7 @@ schemars = { version = "1.2", features = ["chrono04", "derive", "rust_decimal1"]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sonic-rs = "0.5"
+thiserror = "2"
 tracing = "0.1"
 utoipa = { version = "4", features = ["chrono"], optional = true }
 uuid = { version = "1", features = ["serde"] }

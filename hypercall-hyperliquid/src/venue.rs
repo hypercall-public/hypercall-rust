@@ -1,22 +1,29 @@
+#![expect(
+    clippy::result_large_err,
+    reason = "PerpVenue fixes the established unboxed ClientError result contract"
+)]
+
 #[cfg(feature = "aws-kms")]
 use alloy::signers::aws::{aws_config, aws_sdk_kms, AwsSigner};
 use alloy::signers::Signer;
 use hypercall_client::error::Result;
 use hypercall_client::ClientError;
 use hypersdk::hypercore::{
+    signing::agent_signing_hash,
     types::{
-        Action, BatchCancel, BatchCancelCloid, BatchOrder, Cancel, CancelByCloid,
-        ClearinghouseState, Fill, OkResponse, OrderGrouping, OrderRequest, OrderResponseStatus,
-        OrderTypePlacement, Response, TimeInForce as HyperliquidTimeInForce,
+        Action, ActionRequest, BatchCancel, BatchCancelCloid, BatchOrder, Builder, Cancel,
+        CancelByCloid, ClearinghouseState, Fill, OkResponse, OrderGrouping, OrderRequest,
+        OrderResponseStatus, OrderTypePlacement, Response, TimeInForce as HyperliquidTimeInForce,
     },
     Cloid, HttpClient, NonceHandler, PrivateKeySigner,
 };
 use rust_decimal::{Decimal, RoundingStrategy};
 
 use crate::{
-    hyperliquid_client_with_base_url, HyperliquidAddress, HyperliquidChain, HyperliquidPerpAsset,
-    HyperliquidPerpAssetRegistry, PerpVenue, PerpVenueCancelByClientIdRequest,
-    PerpVenueCancelByOidRequest, PerpVenueFuture, PerpVenueOrderRequest, Tif,
+    hyperliquid_client_with_base_url, signing_wire::action_connection_id, HyperliquidAddress,
+    HyperliquidChain, HyperliquidPerpAsset, HyperliquidPerpAssetRegistry, PerpVenue,
+    PerpVenueCancelByClientIdRequest, PerpVenueCancelByOidRequest, PerpVenueFuture,
+    PerpVenueOrderRequest, Tif,
 };
 
 pub type HyperliquidOrderResponseStatus = OrderResponseStatus;
@@ -31,6 +38,7 @@ pub struct DirectHyperliquidPerpVenue<S = PrivateKeySigner> {
     nonce: NonceHandler,
     registry: HyperliquidPerpAssetRegistry,
     vault_address: Option<HyperliquidAddress>,
+    builder_address: Option<HyperliquidAddress>,
 }
 
 impl DirectHyperliquidPerpVenue<PrivateKeySigner> {
@@ -68,7 +76,7 @@ impl DirectHyperliquidPerpVenue<PrivateKeySigner> {
     ) -> Result<Self> {
         let signer = private_key
             .parse::<PrivateKeySigner>()
-            .map_err(|error| ClientError::Signing(format!("invalid Hyperliquid key: {error}")))?;
+            .map_err(|error| ClientError::signing("invalid Hyperliquid key", error))?;
         Ok(Self::from_signer_with_client(client, signer, registry))
     }
 }
@@ -119,10 +127,10 @@ impl DirectHyperliquidPerpVenue<AwsSigner> {
         let signer = AwsSigner::new(kms_client, key_id.clone(), None)
             .await
             .map_err(|error| {
-                ClientError::Signing(format!(
-                    "failed to initialize AWS KMS Hyperliquid signer {}: {}",
-                    key_id, error
-                ))
+                ClientError::signing(
+                    format!("failed to initialize AWS KMS Hyperliquid signer {key_id}"),
+                    error,
+                )
             })?;
         Ok(Self::from_signer_with_client(client, signer, registry))
     }
@@ -149,12 +157,29 @@ impl<S> DirectHyperliquidPerpVenue<S> {
             nonce: NonceHandler::default(),
             registry,
             vault_address: None,
+            builder_address: None,
         }
     }
 
     pub fn with_vault_address(mut self, vault_address: HyperliquidAddress) -> Self {
         self.vault_address = Some(vault_address);
         self
+    }
+
+    /// Attribute orders to a builder without charging an additional fee.
+    /// The trading account must have approved this builder on Hyperliquid.
+    pub fn with_zero_fee_builder(mut self, builder_address: HyperliquidAddress) -> Self {
+        self.builder_address = Some(builder_address);
+        self
+    }
+
+    /// Wallet that signs direct venue orders. This may differ from the
+    /// builder-approval owner and the vault or subaccount order target.
+    pub fn signer_address(&self) -> HyperliquidAddress
+    where
+        S: Signer,
+    {
+        self.signer.address()
     }
 
     pub fn validate_order(&self, request: &PerpVenueOrderRequest) -> Result<()> {
@@ -168,20 +193,14 @@ impl<S> DirectHyperliquidPerpVenue<S> {
         self.client
             .clearinghouse_state(user, None)
             .await
-            .map_err(|error| ClientError::Api {
-                status: 400,
-                message: error.to_string(),
-            })
+            .map_err(|source| ClientError::api_source(400, crate::HypersdkReport(source)))
     }
 
     pub async fn user_fills(&self, user: HyperliquidAddress) -> Result<Vec<Fill>> {
         self.client
             .user_fills(user)
             .await
-            .map_err(|error| ClientError::Api {
-                status: 400,
-                message: error.to_string(),
-            })
+            .map_err(|source| ClientError::api_source(400, crate::HypersdkReport(source)))
     }
 
     fn resolve_asset(&self, symbol: &str) -> Result<&HyperliquidPerpAsset> {
@@ -195,6 +214,11 @@ impl<S> DirectHyperliquidPerpVenue<S> {
     }
 
     fn order_batch(&self, request: &PerpVenueOrderRequest) -> Result<BatchOrder> {
+        if self.builder_address == Some(HyperliquidAddress::ZERO) {
+            return Err(ClientError::InvalidInput(
+                "builder address must not be zero".to_string(),
+            ));
+        }
         let asset = self.resolve_asset(&request.symbol)?;
         let size = quantize_size(decimal_from_f64(request.size, "size")?, asset.sz_decimals)?;
         let limit_px = quantize_limit_price(
@@ -215,7 +239,10 @@ impl<S> DirectHyperliquidPerpVenue<S> {
                 cloid: request.client_id.map(cloid_from_u128).unwrap_or_default(),
             }],
             grouping: OrderGrouping::Na,
-            builder: None,
+            builder: self.builder_address.map(|builder_address| Builder {
+                builder_address,
+                fee: 0,
+            }),
         })
     }
 
@@ -248,25 +275,48 @@ where
     S: HyperliquidSigner,
 {
     async fn sign_and_send(&self, action: Action) -> Result<Response> {
-        let signed = action
-            .sign(
-                &self.signer,
-                self.nonce.next(),
-                self.vault_address,
-                None,
-                self.client.chain(),
-            )
-            .await
-            .map_err(|error| {
-                ClientError::Signing(format!("Hyperliquid action signing failed: {error}"))
-            })?;
+        let nonce = self.nonce.next();
+        let signed = if matches!(&action, Action::Order(batch) if batch.builder.is_some()) {
+            let connection_id = action_connection_id(&action, nonce, self.vault_address, None)
+                .map_err(|error| ClientError::Signing {
+                    operation: "Hyperliquid builder order hashing failed".to_string(),
+                    source: Box::new(error),
+                })?;
+            let digest = agent_signing_hash(self.client.chain(), connection_id);
+            let signature =
+                self.signer
+                    .sign_hash(&digest)
+                    .await
+                    .map_err(|error| ClientError::Signing {
+                        operation: "Hyperliquid builder order signing failed".to_string(),
+                        source: Box::new(error),
+                    })?;
+            ActionRequest {
+                signature: signature.into(),
+                action,
+                nonce,
+                vault_address: self.vault_address,
+                expires_after: None,
+            }
+        } else {
+            action
+                .sign(
+                    &self.signer,
+                    nonce,
+                    self.vault_address,
+                    None,
+                    self.client.chain(),
+                )
+                .await
+                .map_err(|error| ClientError::Signing {
+                    operation: "Hyperliquid action signing failed".to_string(),
+                    source: error.into_boxed_dyn_error(),
+                })?
+        };
         self.client
             .send(signed)
             .await
-            .map_err(|error| ClientError::Api {
-                status: 400,
-                message: error.to_string(),
-            })
+            .map_err(|error| ClientError::api_source(400, crate::HypersdkReport(error)))
     }
 }
 
@@ -511,6 +561,46 @@ mod tests {
             }
             _ => panic!("expected limit order"),
         }
+    }
+
+    #[test]
+    fn order_batch_attaches_only_zero_fee_builder() {
+        let builder_address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let venue = direct_hyperliquid_venue().with_zero_fee_builder(builder_address);
+        let batch = venue
+            .order_batch(&PerpVenueOrderRequest::new(
+                "BTC-PERP",
+                true,
+                70_000.0,
+                0.01,
+                Tif::Ioc,
+            ))
+            .unwrap();
+        let builder = batch.builder.unwrap();
+        assert_eq!(builder.builder_address, builder_address);
+        assert_eq!(builder.fee, 0);
+    }
+
+    #[test]
+    fn order_validation_rejects_zero_builder_address() {
+        let venue = direct_hyperliquid_venue().with_zero_fee_builder(HyperliquidAddress::ZERO);
+        let order = PerpVenueOrderRequest::new("BTC-PERP", true, 70_000.0, 0.01, Tif::Ioc);
+        assert!(matches!(
+            venue.validate_order(&order),
+            Err(ClientError::InvalidInput(message)) if message == "builder address must not be zero"
+        ));
+    }
+
+    #[test]
+    fn signer_address_comes_from_signer() {
+        assert_eq!(
+            direct_hyperliquid_venue().signer_address(),
+            "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+                .parse::<HyperliquidAddress>()
+                .unwrap()
+        );
     }
 
     #[test]

@@ -6,33 +6,27 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[displaystr::display]
 pub enum ConfigError {
-    #[error("failed to read config {path}: {source}")]
     Read {
         path: String,
         #[source]
         source: std::io::Error,
-    },
-    #[error("failed to parse TOML config {path}: {source}")]
+    } = "failed to read config {path}: {source}",
     Parse {
         path: String,
         #[source]
         source: toml::de::Error,
-    },
-    #[error("liquidation.mode must be standard_margin_only, got {0}")]
-    UnsupportedMode(String),
-    #[error("dry_run must be true unless liquidation.enabled is false or the caller explicitly overrides this guard")]
-    DryRunRequired,
-    #[error("{field} must be positive")]
-    NonPositive { field: &'static str },
-    #[error("hedge.max_order_notional_usdc must be greater than or equal to hedge.min_order_notional_usdc")]
-    InvalidHedgeNotionalRange,
-    #[error("hedge.max_slippage_bps must be less than 10000")]
-    InvalidMaxSlippageBps,
-    #[error("plaintext key config requires private_key_env")]
-    MissingPlaintextEnv,
-    #[error("kms key config requires key_id_env")]
-    MissingKmsKeyIdEnv,
+    } = "failed to parse TOML config {path}: {source}",
+    UnsupportedMode(String) = "liquidation.mode must be standard_margin_only, got {_0}",
+    DryRunRequired = "dry_run must be true unless liquidation.enabled is false or the caller explicitly overrides this guard",
+    NonPositive {
+        field: &'static str,
+    } = "{field} must be positive",
+    InvalidHedgeNotionalRange = "hedge.max_order_notional_usdc must be greater than or equal to hedge.min_order_notional_usdc",
+    InvalidMaxSlippageBps = "hedge.max_slippage_bps must be less than 10000",
+    MissingPlaintextEnv = "plaintext key config requires private_key_env",
+    MissingKmsKeyIdEnv = "kms key config requires key_id_env",
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

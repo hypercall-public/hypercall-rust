@@ -4,25 +4,27 @@ use thiserror::Error;
 use crate::config::{KeyConfig, KeyKind};
 
 #[derive(Debug, Error)]
+#[displaystr::display]
 pub enum KeyError {
-    #[error("key config is missing {field}")]
-    MissingConfigField { field: &'static str },
-    #[error("environment variable {env_var} is not set")]
-    MissingEnvValue { env_var: String },
-    #[error("unsupported KMS provider {provider}")]
-    UnsupportedKmsProvider { provider: String },
-    #[error("KMS key config requires building hypercall-liquidator with the kms feature")]
-    KmsFeatureDisabled,
-    #[error("AWS KMS wallet initialization failed: {0}")]
-    KmsWallet(String),
-    #[error(
-        "this operation requires plaintext private_key_env; KMS private keys are not exportable"
-    )]
-    PrivateKeyUnavailableForPlaintextExport,
-    #[error("wallet initialization failed: {0}")]
-    Wallet(String),
-    #[error("chain id {chain_id} does not fit in u32")]
-    ChainIdOutOfRange { chain_id: u64 },
+    MissingConfigField {
+        field: &'static str,
+    } = "key config is missing {field}",
+    MissingEnvValue {
+        env_var: String,
+    } = "environment variable {env_var} is not set",
+    UnsupportedKmsProvider {
+        provider: String,
+    } = "unsupported KMS provider {provider}",
+    KmsFeatureDisabled =
+        "KMS key config requires building hypercall-liquidator with the kms feature",
+    KmsWallet(#[source] Box<hypercall_client::ClientError>) =
+        "AWS KMS wallet initialization failed: {_0}",
+    PrivateKeyUnavailableForPlaintextExport =
+        "this operation requires plaintext private_key_env; KMS private keys are not exportable",
+    Wallet(#[source] Box<hypercall_client::ClientError>) = "wallet initialization failed: {_0}",
+    ChainIdOutOfRange {
+        chain_id: u64,
+    } = "chain id {chain_id} does not fit in u32",
 }
 
 pub fn plaintext_private_key_from_env(config: &KeyConfig) -> Result<String, KeyError> {
@@ -49,7 +51,7 @@ pub async fn hypercall_wallet_from_key_config(
         KeyKind::Plaintext => {
             let private_key = plaintext_private_key_from_env(config)?;
             HypercallWallet::from_private_key(&private_key, chain_id)
-                .map_err(|error| KeyError::Wallet(error.to_string()))
+                .map_err(|source| KeyError::Wallet(Box::new(source)))
         }
         KeyKind::Kms => {
             #[cfg(not(feature = "kms"))]
@@ -76,7 +78,7 @@ pub async fn hypercall_wallet_from_key_config(
                 })?;
                 HypercallWallet::from_aws_kms_key_id(key_id, chain_id)
                     .await
-                    .map_err(|error| KeyError::KmsWallet(error.to_string()))
+                    .map_err(|source| KeyError::KmsWallet(Box::new(source)))
             }
         }
     }

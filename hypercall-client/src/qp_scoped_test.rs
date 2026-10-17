@@ -621,3 +621,120 @@ async fn keepalive_republishes_quiet_scopes() {
     client.abort();
     server.abort();
 }
+
+/// Records every attributed RFQ drop alongside the bulk stale count, so a
+/// test can assert both that the message came back with its identity and
+/// that the compatibility count still moved.
+struct RecordingCallbacks {
+    dropped: Mutex<Vec<(ClientOutbound, RfqDropReason)>>,
+    stale: std::sync::atomic::AtomicU64,
+}
+impl QpClientCallbacks for RecordingCallbacks {
+    fn on_rfq_response_dropped(&self, message: &ClientOutbound, reason: RfqDropReason) {
+        self.dropped.lock().unwrap().push((message.clone(), reason));
+    }
+    fn on_stale_messages_drained(&self, count: u64) {
+        self.stale
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn rfq_decline(rfq_id: &str) -> ClientOutbound {
+    ClientOutbound::RfqResponse {
+        rfq_id: rfq_id.to_string(),
+        action: "decline".to_string(),
+        legs: None,
+        net_premium: None,
+        valid_for_ms: None,
+        signature: None,
+        nonce: None,
+    }
+}
+
+/// An RFQ response whose deadline has already passed must be dropped, and
+/// the drop must hand back the message itself so the caller can attribute
+/// it to its `rfq_id`. A live response queued behind it must still be sent.
+/// The bulk stale count keeps moving too, so existing consumers of that
+/// signal see unchanged totals.
+#[tokio::test]
+async fn expired_rfq_response_is_reported_with_its_message() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (frames_tx, mut frames_rx) = mpsc::channel(16);
+
+    let server = tokio::spawn(async move {
+        mock_qp_session(
+            &listener,
+            vec![CAP_SCOPED_INDICATIVE.to_string()],
+            frames_tx,
+            1,
+        )
+        .await;
+    });
+
+    let wallet = Arc::new(HypercallWallet::from_private_key(TEST_PRIVATE_KEY, 999).unwrap());
+    let (handle, runtime) = qp_scoped_channel();
+
+    // Queued BEFORE the runtime starts so dequeue order is deterministic:
+    // the expired one is examined first and must be dropped, not sent.
+    let already_expired = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("monotonic clock is at least 1s old");
+    handle
+        .send_rfq_response(rfq_decline("expired-1"), already_expired)
+        .unwrap();
+    handle
+        .send_rfq_response(
+            rfq_decline("live-1"),
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+
+    let callbacks = Arc::new(RecordingCallbacks {
+        dropped: Mutex::new(Vec::new()),
+        stale: std::sync::atomic::AtomicU64::new(0),
+    });
+    let config = QpClientConfig::new(format!("http://{addr}"));
+    let (inbound_tx, _inbound_rx) = mpsc::channel(16);
+    let client = tokio::spawn(run_qp_scoped_client(
+        config,
+        wallet,
+        runtime,
+        inbound_tx,
+        Arc::clone(&callbacks) as Arc<dyn QpClientCallbacks>,
+    ));
+
+    // Only the live response reaches the wire.
+    let sent = tokio::time::timeout(Duration::from_secs(5), frames_rx.recv())
+        .await
+        .expect("frame within timeout")
+        .expect("session forwarded a frame");
+    assert!(
+        matches!(&sent, ClientOutbound::RfqResponse { rfq_id, .. } if rfq_id == "live-1"),
+        "expected the live response on the wire, got {sent:?}"
+    );
+
+    // The expired one came back through the attributed hook, with its id
+    // intact and the right reason.
+    let dropped = callbacks.dropped.lock().unwrap().clone();
+    assert_eq!(
+        dropped.len(),
+        1,
+        "exactly one drop expected, got {dropped:?}"
+    );
+    let (message, reason) = &dropped[0];
+    assert_eq!(*reason, RfqDropReason::Expired);
+    assert!(
+        matches!(message, ClientOutbound::RfqResponse { rfq_id, .. } if rfq_id == "expired-1"),
+        "dropped message must be the expired response, got {message:?}"
+    );
+
+    // Compatibility: the bulk count still reflects the drop.
+    assert!(
+        callbacks.stale.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+        "on_stale_messages_drained must still fire for an RFQ drop"
+    );
+
+    client.abort();
+    server.abort();
+}

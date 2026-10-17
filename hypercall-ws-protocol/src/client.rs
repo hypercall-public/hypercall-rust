@@ -56,41 +56,9 @@ pub enum GatewayErrorCode {
     ProtocolError,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnsupportedWriteKind {
-    PlaceOrder,
-    SubmitRfq,
-    SubmitAutoExecuteRfq,
-    AcceptRfqQuote,
-}
-
-impl UnsupportedWriteKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::PlaceOrder => "PlaceOrder",
-            Self::SubmitRfq => "SubmitRfq",
-            Self::SubmitAutoExecuteRfq => "SubmitAutoExecuteRfq",
-            Self::AcceptRfqQuote => "AcceptRfqQuote",
-        }
-    }
-
-    pub fn from_message_type(message_type: &str) -> Option<Self> {
-        match message_type {
-            "PlaceOrder" => Some(Self::PlaceOrder),
-            "SubmitRfq" => Some(Self::SubmitRfq),
-            "SubmitAutoExecuteRfq" => Some(Self::SubmitAutoExecuteRfq),
-            "AcceptRfqQuote" => Some(Self::AcceptRfqQuote),
-            _ => None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        ClientControlMessage, GatewayErrorCode, GatewayStatus, GatewayStatusMessage,
-        UnsupportedWriteKind,
-    };
+    use super::{ClientControlMessage, GatewayErrorCode, GatewayStatus, GatewayStatusMessage};
 
     #[test]
     fn subscribe_preserves_existing_wire_shape() {
@@ -132,14 +100,5 @@ mod tests {
             serde_json::to_string(&msg).unwrap(),
             r#"{"type":"GatewayError","code":"unsupported_write","message":"write commands are not supported on websocket"}"#
         );
-    }
-
-    #[test]
-    fn unsupported_write_detection_is_explicit() {
-        assert_eq!(
-            UnsupportedWriteKind::from_message_type("PlaceOrder"),
-            Some(UnsupportedWriteKind::PlaceOrder)
-        );
-        assert_eq!(UnsupportedWriteKind::from_message_type("Subscribe"), None);
     }
 }

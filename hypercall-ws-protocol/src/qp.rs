@@ -81,24 +81,14 @@ fn hex_nibble(c: u8) -> Option<u8> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[displaystr::display]
 pub enum ScopeIdParseError {
     /// Wire scope must be exactly 32 hex characters (16 bytes).
-    Length(usize),
+    Length(usize) = "scope must be 32 lowercase hex chars, got length {_0}",
     /// Wire scope must be canonical lowercase hex.
-    NotLowercaseHex,
+    NotLowercaseHex = "scope must be canonical lowercase hex",
 }
-
-impl std::fmt::Display for ScopeIdParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Length(n) => write!(f, "scope must be 32 lowercase hex chars, got length {n}"),
-            Self::NotLowercaseHex => f.write_str("scope must be canonical lowercase hex"),
-        }
-    }
-}
-
-impl std::error::Error for ScopeIdParseError {}
 
 impl Serialize for ScopeId {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {

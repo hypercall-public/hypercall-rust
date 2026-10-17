@@ -5,14 +5,14 @@ use alloy::primitives::B256;
 use crate::{PerpTimeInForce, WalletAddress};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-fn serialize_b256<S>(value: &B256, serializer: S) -> Result<S::Ok, S::Error>
+pub(crate) fn serialize_b256<S>(value: &B256, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
     serializer.serialize_str(&format!("{value:#x}"))
 }
 
-fn deserialize_b256<'de, D>(deserializer: D) -> Result<B256, D::Error>
+pub(crate) fn deserialize_b256<'de, D>(deserializer: D) -> Result<B256, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -35,7 +35,7 @@ where
 
 pub const JSON_SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
 
-fn serialize_safe_u64<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+pub(crate) fn serialize_safe_u64<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -46,7 +46,7 @@ where
     }
 }
 
-fn serialize_safe_u128<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
+pub(crate) fn serialize_safe_u128<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -57,7 +57,7 @@ where
     }
 }
 
-fn deserialize_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+pub(crate) fn deserialize_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -79,7 +79,7 @@ where
         .map_err(serde::de::Error::custom)
 }
 
-fn deserialize_u128<'de, D>(deserializer: D) -> Result<u128, D::Error>
+pub(crate) fn deserialize_u128<'de, D>(deserializer: D) -> Result<u128, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -101,14 +101,17 @@ where
         .map_err(serde::de::Error::custom)
 }
 
-fn serialize_perp_tif<S>(value: &PerpTimeInForce, serializer: S) -> Result<S::Ok, S::Error>
+pub(crate) fn serialize_perp_tif<S>(
+    value: &PerpTimeInForce,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
     serializer.serialize_u8(value.encoded())
 }
 
-fn deserialize_perp_tif<'de, D>(deserializer: D) -> Result<PerpTimeInForce, D::Error>
+pub(crate) fn deserialize_perp_tif<'de, D>(deserializer: D) -> Result<PerpTimeInForce, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -326,6 +329,7 @@ pub enum DirectiveDomainStatus {
 #[serde(rename_all = "snake_case")]
 pub enum DirectiveDeliveryStatus {
     Pending,
+    Submitted,
     Broadcasted,
     Included,
     PendingCoreDelivery,

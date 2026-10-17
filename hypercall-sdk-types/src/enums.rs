@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// displaystr supports only enums, so this parse error struct keeps thiserror's
+// display attribute.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown {kind}: {value}")]
 pub struct ParseSdkEnumError {
     kind: &'static str,
     value: String,
@@ -18,14 +21,6 @@ impl ParseSdkEnumError {
         }
     }
 }
-
-impl fmt::Display for ParseSdkEnumError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "unknown {}: {}", self.kind, self.value)
-    }
-}
-
-impl std::error::Error for ParseSdkEnumError {}
 
 /// Margin regime selected for an account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,6 +316,8 @@ pub enum OrderAction {
     CancelOrder,
     #[serde(rename = "REPLACE_ORDER")]
     ReplaceOrder,
+    #[serde(rename = "ATOMIC_REPLACE_ORDER")]
+    AtomicReplaceOrder,
 }
 
 /// Transaction status for on-chain transactions.

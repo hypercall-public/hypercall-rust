@@ -16,8 +16,46 @@ fn account_salt_accepts_uint96_maximum() {
 
 #[test]
 fn account_salt_rejects_value_above_uint96() {
-    let error = validate_salt(Some(1_u128 << 96)).unwrap_err();
-    assert!(error.to_string().contains("exceeds uint96"));
+    let invalid_salt = 1_u128 << 96;
+    let error = validate_salt(Some(invalid_salt)).unwrap_err();
+    assert!(matches!(
+        &error,
+        ClientError::InvalidInput(message)
+            if message == &format!("account salt {invalid_salt} exceeds uint96")
+    ));
+    assert_eq!(
+        error.to_string(),
+        format!("invalid input: account salt {invalid_salt} exceeds uint96")
+    );
+}
+
+#[tokio::test]
+async fn invalid_rpc_url_preserves_the_public_error_text() {
+    let invalid_rpc_url = "://";
+    let source = invalid_rpc_url.parse::<reqwest::Url>().unwrap_err();
+    let client = HypercallClient::new("http://unused.invalid");
+    let manager = HypercallWallet::random(999);
+
+    let error = client
+        .create_account(
+            &manager,
+            CreateAccountParams {
+                rpc_url: invalid_rpc_url.to_owned(),
+                factory_address: AccountAddress::from(Address::repeat_byte(5)),
+                salt: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        &error,
+        ClientError::InvalidInputSource { context, .. } if context == "HyperEVM RPC URL"
+    ));
+    assert_eq!(
+        error.to_string(),
+        format!("invalid input: invalid HyperEVM RPC URL: {source}")
+    );
 }
 
 #[test]
@@ -45,7 +83,16 @@ fn gas_limit_buffer_matches_frontend_rounding() {
 #[test]
 fn creation_deposit_buffer_fails_on_overflow() {
     let error = buffered_u256(U256::MAX, CREATION_DEPOSIT_BUFFER_BPS).unwrap_err();
-    assert!(error.to_string().contains("deposit buffer overflow"));
+    assert!(matches!(
+        &error,
+        ClientError::ArithmeticOverflow {
+            operation: "account creation deposit buffer"
+        }
+    ));
+    assert_eq!(
+        error.to_string(),
+        "account creation deposit buffer overflow"
+    );
 }
 
 #[test]
@@ -60,7 +107,7 @@ fn account_created_event_is_required() {
     let manager = Address::repeat_byte(1);
     let account = Address::repeat_byte(2);
     let error = validate_account_created_event(None, manager, account).unwrap_err();
-    assert!(error.to_string().contains("did not emit AccountCreated"));
+    assert!(matches!(error, ClientError::MissingAccountCreatedEvent));
 }
 
 #[test]
@@ -75,15 +122,23 @@ fn account_created_event_must_match_manager_and_simulation() {
 
     let error =
         validate_account_created_event(Some(&event), Address::repeat_byte(3), account).unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("does not match submitting manager"));
+    assert!(matches!(
+        error,
+        ClientError::AccountCreatedManagerMismatch {
+            observed,
+            expected,
+        } if observed == manager && expected == Address::repeat_byte(3)
+    ));
 
     let error =
         validate_account_created_event(Some(&event), manager, Address::repeat_byte(4)).unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("does not match simulated account"));
+    assert!(matches!(
+        error,
+        ClientError::AccountCreatedAddressMismatch {
+            observed,
+            expected,
+        } if observed == account && expected == Address::repeat_byte(4)
+    ));
 }
 
 #[test]
@@ -124,9 +179,12 @@ async fn contract_read_failure_is_contextualized() {
     .await
     .unwrap_err();
 
-    assert!(error
-        .to_string()
-        .contains("failed to read Factory creation deposit"));
+    assert!(matches!(
+        &error,
+        ClientError::Onchain { operation, .. }
+            if operation == "read Factory creation deposit"
+    ));
+    assert!(std::error::Error::source(&error).is_some());
 }
 
 #[tokio::test]
@@ -146,7 +204,10 @@ async fn simulation_failure_is_contextualized() {
     .await
     .unwrap_err();
 
-    assert!(error
-        .to_string()
-        .contains("failed to simulate Factory account creation"));
+    assert!(matches!(
+        &error,
+        ClientError::Onchain { operation, .. }
+            if operation == "simulate Factory account creation"
+    ));
+    assert!(std::error::Error::source(&error).is_some());
 }

@@ -1,4 +1,8 @@
 //! EIP-712 wallet for signing Hypercall operations.
+#![expect(
+    clippy::result_large_err,
+    reason = "wallet methods preserve the established unboxed public ClientError contract"
+)]
 //!
 //! Every write operation on Hypercall requires an EIP-712 signature. This module
 //! provides [`HypercallWallet`] which wraps a private key and exposes typed
@@ -44,14 +48,19 @@
 //! Each `next_nonce()` call returns a unique value. Signed on-chain actions
 //! require each (signer, nonce) pair to be used at most once.
 
-use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex as StdMutex, OnceLock, Weak,
+    },
+};
 
 #[cfg(feature = "kms")]
 use alloy::signers::aws::{aws_config, aws_sdk_kms, AwsSigner};
 use alloy::{
-    primitives::{Signature, B256},
+    primitives::{Address, Signature, B256},
     signers::{local::PrivateKeySigner, Signer},
     sol,
     sol_types::{Eip712Domain, SolStruct},
@@ -60,8 +69,30 @@ use hypercall_sdk_types::{
     HcUpdateApiWalletAction, HlCancelByCloidAction, HlCancelByOidAction, HlLimitOrderAction,
     HlSetAbstractionAction, OrderRoute, WalletAddress,
 };
+#[cfg(feature = "rfq-v2")]
+use hypercall_sdk_types::{RfqV2ReadGrant, RfqV2Signature};
+use tokio::sync::Mutex;
 
+#[cfg(feature = "kms")]
+use crate::error::SigningUnavailableReason;
 use crate::error::{ClientError, Result};
+
+pub(crate) fn evm_submission_lock(sender: Address) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<StdMutex<HashMap<Address, Weak<Mutex<()>>>>> = OnceLock::new();
+
+    let mut locks = LOCKS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .expect("EVM submission lock registry poisoned");
+    if let Some(lock) = locks.get(&sender).and_then(Weak::upgrade) {
+        return lock;
+    }
+
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(sender, Arc::downgrade(&lock));
+    lock
+}
 
 /// Hypercall account address used by the public client API.
 #[derive(
@@ -222,6 +253,23 @@ sol! {
     }
 
     #[derive(Debug, PartialEq, Eq)]
+    struct SendAsset {
+        address destination;
+        address subAccount;
+        uint32 srcDex;
+        uint32 dstDex;
+        uint64 token;
+        uint64 amountWei;
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct HLSendAsset {
+        address account;
+        uint64 nonce;
+        SendAsset action;
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
     struct SetAbstraction {
         address user;
         uint8 abstraction;
@@ -337,6 +385,34 @@ sol! {
         uint64 auctionVersion;
         uint64 nonce;
     }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct WithdrawUsdc {
+        address wallet;
+        address account;
+        address destination;
+        string amount;
+        uint64 nonce;
+    }
+
+    /// Queue a withdrawal of PM lending pool shares, paid to `wallet`
+    /// (`POST /v1/pm-pool/redemptions`).
+    #[derive(Debug, PartialEq, Eq)]
+    struct RedeemPoolShares {
+        address wallet;
+        string shares;
+        uint64 nonce;
+    }
+
+    /// Cancel queued PM lending pool share redemptions
+    /// (`POST /v1/pm-pool/redemptions/cancel`). `requestIds` is the id list,
+    /// in request order, joined with `,`.
+    #[derive(Debug, PartialEq, Eq)]
+    struct CancelPoolRedemptions {
+        address wallet;
+        string requestIds;
+        uint64 nonce;
+    }
 }
 
 fn hypercall_domain(chain_id: u32) -> Eip712Domain {
@@ -346,6 +422,17 @@ fn hypercall_domain(chain_id: u32) -> Eip712Domain {
         chain_id: Some(alloy::primitives::U256::from(chain_id)),
         verifying_contract: Some(alloy::primitives::Address::ZERO),
         salt: None,
+    }
+}
+
+#[cfg(feature = "rfq-v2")]
+sol! {
+    /// Must match the RFQ service's AuthorizeRfqReadV2 EIP-712 type exactly.
+    struct AuthorizeRfqReadV2 {
+        address account;
+        uint64 issuedAtMs;
+        uint64 expiresAtMs;
+        uint64 nonce;
     }
 }
 
@@ -401,12 +488,23 @@ impl SignerBackend {
         }
     }
 
+    async fn sign_message(
+        &self,
+        message: &[u8],
+    ) -> std::result::Result<Signature, alloy::signers::Error> {
+        match self {
+            SignerBackend::Local(signer) => signer.sign_message(message).await,
+            #[cfg(feature = "kms")]
+            SignerBackend::AwsKms(signer) => signer.sign_message(message).await,
+        }
+    }
+
     fn try_private_key_hex(&self) -> Result<String> {
         match self {
             SignerBackend::Local(signer) => Ok(format!("0x{}", hex::encode(signer.to_bytes()))),
             #[cfg(feature = "kms")]
-            SignerBackend::AwsKms(_) => Err(ClientError::Signing(
-                "private key material is unavailable for AWS KMS wallets".to_string(),
+            SignerBackend::AwsKms(_) => Err(ClientError::SigningUnavailable(
+                SigningUnavailableReason::AwsKmsPrivateKeyMaterial,
             )),
         }
     }
@@ -508,7 +606,30 @@ pub struct UpdateApiWalletSignature {
     pub action: HcUpdateApiWalletAction,
 }
 
-#[allow(async_fn_in_trait)]
+/// Exact Standard Margin `WithdrawUsdc` EIP-712 payload.
+#[derive(Debug, Clone, Copy)]
+pub struct StandardUsdcWithdrawalSignature<'a> {
+    pub wallet: AccountAddress,
+    pub account: AccountAddress,
+    pub destination: AccountAddress,
+    pub amount: &'a str,
+    pub nonce: u64,
+}
+
+/// Exact Portfolio Margin `HLSendAsset` EIP-712 payload.
+#[derive(Debug, Clone, Copy)]
+pub struct PortfolioUsdcWithdrawalSignature {
+    pub account: AccountAddress,
+    pub destination: AccountAddress,
+    pub amount_wei: u64,
+    pub destination_dex: u32,
+    pub nonce: u64,
+}
+
+#[expect(
+    async_fn_in_trait,
+    reason = "public signer trait; callers choose their own executor, so futures carry no Send bound"
+)]
 pub trait HypercallSigner {
     fn address(&self) -> AccountAddress;
     fn next_nonce(&self) -> u64;
@@ -525,7 +646,10 @@ pub trait HypercallSigner {
     ) -> Result<String>;
 }
 
-#[allow(async_fn_in_trait)]
+#[expect(
+    async_fn_in_trait,
+    reason = "public signer trait; callers choose their own executor, so futures carry no Send bound"
+)]
 pub trait PerpDirectiveSigner: HypercallSigner {
     async fn sign_perp_limit_order_payload(
         &self,
@@ -541,7 +665,10 @@ pub trait PerpDirectiveSigner: HypercallSigner {
     ) -> Result<String>;
 }
 
-#[allow(async_fn_in_trait)]
+#[expect(
+    async_fn_in_trait,
+    reason = "public signer trait; callers choose their own executor, so futures carry no Send bound"
+)]
 pub trait ManagerDirectiveSigner: HypercallSigner {
     async fn sign_set_account_abstraction_payload(
         &self,
@@ -549,11 +676,30 @@ pub trait ManagerDirectiveSigner: HypercallSigner {
     ) -> Result<String>;
 }
 
-#[allow(async_fn_in_trait)]
+#[expect(
+    async_fn_in_trait,
+    reason = "public signer trait; callers choose their own executor, so futures carry no Send bound"
+)]
 pub trait ApiWalletDirectiveSigner: HypercallSigner {
     async fn sign_update_api_wallet_payload(
         &self,
         payload: UpdateApiWalletSignature,
+    ) -> Result<String>;
+}
+
+/// Signs the two USDC withdrawal schemas without expanding existing signer traits.
+#[expect(
+    async_fn_in_trait,
+    reason = "public signer trait; callers choose their own executor, so futures carry no Send bound"
+)]
+pub trait UsdcWithdrawalSigner: HypercallSigner {
+    async fn sign_standard_usdc_withdrawal_payload(
+        &self,
+        payload: StandardUsdcWithdrawalSignature<'_>,
+    ) -> Result<String>;
+    async fn sign_portfolio_usdc_withdrawal_payload(
+        &self,
+        payload: PortfolioUsdcWithdrawalSignature,
     ) -> Result<String>;
 }
 
@@ -681,6 +827,22 @@ impl ApiWalletDirectiveSigner for HypercallWallet {
     }
 }
 
+impl UsdcWithdrawalSigner for HypercallWallet {
+    async fn sign_standard_usdc_withdrawal_payload(
+        &self,
+        payload: StandardUsdcWithdrawalSignature<'_>,
+    ) -> Result<String> {
+        HypercallWallet::sign_standard_usdc_withdrawal_payload(self, payload).await
+    }
+
+    async fn sign_portfolio_usdc_withdrawal_payload(
+        &self,
+        payload: PortfolioUsdcWithdrawalSignature,
+    ) -> Result<String> {
+        HypercallWallet::sign_portfolio_usdc_withdrawal_payload(self, payload).await
+    }
+}
+
 impl HypercallWallet {
     pub(crate) fn ethereum_wallet(&self) -> alloy::network::EthereumWallet {
         self.signer.ethereum_wallet()
@@ -690,6 +852,68 @@ impl HypercallWallet {
         u64::from(self.chain_id)
     }
 
+    /// Sign Hypercall's timestamped EIP-191 authentication message
+    /// (`Sign this message to authenticate for Hypercall\nTimestamp: {timestamp}`),
+    /// as the manager-authenticated routes such as TEE API wallet enrollment
+    /// require. `timestamp` is Unix seconds.
+    pub async fn sign_authentication_message(&self, timestamp: i64) -> Result<String> {
+        let message =
+            format!("Sign this message to authenticate for Hypercall\nTimestamp: {timestamp}");
+        let signature = self
+            .signer
+            .sign_message(message.as_bytes())
+            .await
+            .map_err(|error| {
+                ClientError::signing("Failed to sign authentication message", error)
+            })?;
+        Ok(format!("{signature}"))
+    }
+
+    #[cfg(feature = "rfq-v2")]
+    /// Sign one RFQ V2 EIP-712 message under the Hypercall domain.
+    pub(crate) async fn sign_rfq_v2_typed_data<T: SolStruct + Send + Sync>(
+        &self,
+        message: &T,
+        what: &'static str,
+    ) -> Result<RfqV2Signature> {
+        let signature = self
+            .signer
+            .sign_typed_data(message, &self.hypercall_domain())
+            .await
+            .map_err(|error| ClientError::signing(format!("Failed to sign {what}"), error))?;
+        RfqV2Signature::from_bytes(signature.as_bytes())
+            .map_err(|error| ClientError::signing(format!("Invalid {what} signature"), error))
+    }
+
+    #[cfg(feature = "rfq-v2")]
+    /// Sign a short-lived private RFQ read grant for an account this wallet
+    /// owns or currently represents as an authorized agent. The service
+    /// verifies the agent relationship on every read.
+    pub async fn sign_rfq_v2_read_grant(
+        &self,
+        account: WalletAddress,
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+        nonce: u64,
+    ) -> Result<RfqV2ReadGrant> {
+        let message = AuthorizeRfqReadV2 {
+            account: account.inner(),
+            issuedAtMs: issued_at_ms,
+            expiresAtMs: expires_at_ms,
+            nonce,
+        };
+        let signature = self
+            .sign_rfq_v2_typed_data(&message, "RFQ V2 read grant")
+            .await?;
+        Ok(RfqV2ReadGrant {
+            account,
+            issued_at_ms,
+            expires_at_ms,
+            nonce,
+            signature,
+        })
+    }
+
     /// Create a new wallet from a private key.
     ///
     /// # Arguments
@@ -697,7 +921,7 @@ impl HypercallWallet {
     /// * `chain_id` - Chain ID for the EIP-712 signing domain. Production uses `999`.
     pub fn from_private_key(private_key: &str, chain_id: u32) -> Result<Self> {
         let signer = PrivateKeySigner::from_str(private_key)
-            .map_err(|e| ClientError::Signing(format!("Invalid private key: {}", e)))?;
+            .map_err(|error| ClientError::signing("Invalid private key", error))?;
 
         let signer = SignerBackend::Local(signer);
         let address = signer.address();
@@ -728,7 +952,7 @@ impl HypercallWallet {
     pub fn from_bytes(bytes: &[u8; 32], chain_id: u32) -> Result<Self> {
         let b256_key = B256::from_slice(bytes);
         let signer = PrivateKeySigner::from_bytes(&b256_key)
-            .map_err(|e| ClientError::Signing(format!("Invalid private key bytes: {}", e)))?;
+            .map_err(|error| ClientError::signing("Invalid private key bytes", error))?;
 
         let signer = SignerBackend::Local(signer);
         let address = signer.address();
@@ -765,9 +989,7 @@ impl HypercallWallet {
         let kms_client = aws_sdk_kms::Client::new(&aws_config);
         let signer = AwsSigner::new(kms_client, key_id, Some(u64::from(chain_id)))
             .await
-            .map_err(|error| {
-                ClientError::Signing(format!("Failed to initialize AWS KMS wallet: {error}"))
-            })?;
+            .map_err(|error| ClientError::signing("Failed to initialize AWS KMS wallet", error))?;
         let signer = SignerBackend::AwsKms(signer);
         let address = signer.address();
 
@@ -916,7 +1138,48 @@ impl HypercallWallet {
             .await
     }
 
-    async fn sign_directive<T>(
+    /// Sign the Standard Margin `WithdrawUsdc` schema.
+    pub async fn sign_standard_usdc_withdrawal_payload(
+        &self,
+        payload: StandardUsdcWithdrawalSignature<'_>,
+    ) -> Result<String> {
+        let message = WithdrawUsdc {
+            wallet: payload.wallet.as_wallet_address().inner(),
+            account: payload.account.as_wallet_address().inner(),
+            destination: payload.destination.as_wallet_address().inner(),
+            amount: payload.amount.to_string(),
+            nonce: payload.nonce,
+        };
+        let signature = self
+            .signer
+            .sign_typed_data(&message, &self.hypercall_domain())
+            .await
+            .map_err(|error| ClientError::signing("Failed to sign WithdrawUsdc", error))?;
+        Ok(format!("{signature}"))
+    }
+
+    /// Sign the manager-domain Portfolio Margin `HLSendAsset` route.
+    pub async fn sign_portfolio_usdc_withdrawal_payload(
+        &self,
+        payload: PortfolioUsdcWithdrawalSignature,
+    ) -> Result<String> {
+        let message = HLSendAsset {
+            account: payload.account.as_wallet_address().inner(),
+            nonce: payload.nonce,
+            action: SendAsset {
+                destination: payload.destination.as_wallet_address().inner(),
+                subAccount: alloy::primitives::Address::ZERO,
+                srcDex: u32::MAX,
+                dstDex: payload.destination_dex,
+                token: 0,
+                amountWei: payload.amount_wei,
+            },
+        };
+        self.sign_directive(&message, "HLSendAsset", "HypercallManagerSign")
+            .await
+    }
+
+    pub(crate) async fn sign_directive<T>(
         &self,
         message: &T,
         type_name: &str,
@@ -930,9 +1193,7 @@ impl HypercallWallet {
             .signer
             .sign_typed_data(message, &domain)
             .await
-            .map_err(|error| {
-                ClientError::Signing(format!("Failed to sign {type_name}: {error}"))
-            })?;
+            .map_err(|error| ClientError::signing(format!("Failed to sign {type_name}"), error))?;
         Ok(format!("{signature}"))
     }
 
@@ -970,7 +1231,7 @@ impl HypercallWallet {
             };
             self.signer.sign_typed_data(&message, &domain).await
         }
-        .map_err(|e| ClientError::Signing(format!("Failed to sign PlaceOrder: {}", e)))?;
+        .map_err(|error| ClientError::signing("Failed to sign PlaceOrder", error))?;
 
         Ok(format!("{}", signature))
     }
@@ -1000,7 +1261,7 @@ impl HypercallWallet {
             .signer
             .sign_typed_data(&message, &domain)
             .await
-            .map_err(|e| ClientError::Signing(format!("Failed to sign CancelOrder: {}", e)))?;
+            .map_err(|error| ClientError::signing("Failed to sign CancelOrder", error))?;
 
         Ok(format!("{}", signature))
     }
@@ -1039,7 +1300,7 @@ impl HypercallWallet {
             };
             self.signer.sign_typed_data(&message, &domain).await
         }
-        .map_err(|e| ClientError::Signing(format!("Failed to sign ReplaceOrder: {}", e)))?;
+        .map_err(|error| ClientError::signing("Failed to sign ReplaceOrder", error))?;
 
         Ok(format!("{}", signature))
     }
@@ -1066,11 +1327,8 @@ impl HypercallWallet {
             .signer
             .sign_typed_data(&message, &domain)
             .await
-            .map_err(|e| {
-                ClientError::Signing(format!(
-                    "Failed to sign StandardMarginLiquidationOrder: {}",
-                    e
-                ))
+            .map_err(|error| {
+                ClientError::signing("Failed to sign StandardMarginLiquidationOrder", error)
             })?;
 
         Ok(format!("{}", signature))
@@ -1089,7 +1347,49 @@ impl HypercallWallet {
             .signer
             .sign_typed_data(&message, &domain)
             .await
-            .map_err(|e| ClientError::Signing(format!("Failed to sign SetMarginMode: {}", e)))?;
+            .map_err(|error| ClientError::signing("Failed to sign SetMarginMode", error))?;
+
+        Ok(format!("{}", signature))
+    }
+
+    /// Sign a RedeemPoolShares action. `shares` must be the exact decimal
+    /// string sent in the request body.
+    pub async fn sign_redeem_pool_shares(&self, shares: &str, nonce: u64) -> Result<String> {
+        let message = RedeemPoolShares {
+            wallet: self.address.as_wallet_address().inner(),
+            shares: shares.to_string(),
+            nonce,
+        };
+
+        let domain = self.hypercall_domain();
+        let signature = self
+            .signer
+            .sign_typed_data(&message, &domain)
+            .await
+            .map_err(|error| ClientError::signing("Failed to sign RedeemPoolShares", error))?;
+
+        Ok(format!("{}", signature))
+    }
+
+    /// Sign a CancelPoolRedemptions action over `request_ids` in the order
+    /// the request sends them (lowercase hyphenated UUIDs).
+    pub async fn sign_cancel_pool_redemptions(
+        &self,
+        request_ids: &[&str],
+        nonce: u64,
+    ) -> Result<String> {
+        let message = CancelPoolRedemptions {
+            wallet: self.address.as_wallet_address().inner(),
+            requestIds: request_ids.join(","),
+            nonce,
+        };
+
+        let domain = self.hypercall_domain();
+        let signature = self
+            .signer
+            .sign_typed_data(&message, &domain)
+            .await
+            .map_err(|error| ClientError::signing("Failed to sign CancelPoolRedemptions", error))?;
 
         Ok(format!("{}", signature))
     }
@@ -1113,7 +1413,7 @@ impl HypercallWallet {
             .signer
             .sign_typed_data(&message, &domain)
             .await
-            .map_err(|e| ClientError::Signing(format!("Failed to sign SubmitRFQ: {}", e)))?;
+            .map_err(|error| ClientError::signing("Failed to sign SubmitRFQ", error))?;
 
         Ok(format!("{}", signature))
     }
@@ -1141,9 +1441,7 @@ impl HypercallWallet {
             .signer
             .sign_typed_data(&message, &domain)
             .await
-            .map_err(|e| {
-                ClientError::Signing(format!("Failed to sign SubmitRFQResponse: {}", e))
-            })?;
+            .map_err(|error| ClientError::signing("Failed to sign SubmitRFQResponse", error))?;
 
         Ok(format!("{}", signature))
     }
@@ -1169,7 +1467,7 @@ impl HypercallWallet {
             .signer
             .sign_typed_data(&message, &domain)
             .await
-            .map_err(|e| ClientError::Signing(format!("Failed to sign AcceptRFQQuote: {}", e)))?;
+            .map_err(|error| ClientError::signing("Failed to sign AcceptRFQQuote", error))?;
 
         Ok(format!("{}", signature))
     }
@@ -1195,9 +1493,7 @@ impl HypercallWallet {
             .signer
             .sign_typed_data(&message, &domain)
             .await
-            .map_err(|e| {
-                ClientError::Signing(format!("Failed to sign SubmitAutoExecuteRfq: {}", e))
-            })?;
+            .map_err(|error| ClientError::signing("Failed to sign SubmitAutoExecuteRfq", error))?;
 
         Ok(format!("{}", signature))
     }
@@ -1219,9 +1515,7 @@ impl HypercallWallet {
             .signer
             .sign_typed_data(&message, &domain)
             .await
-            .map_err(|e| {
-                ClientError::Signing(format!("Failed to sign ConnectQuoteProvider: {}", e))
-            })?;
+            .map_err(|error| ClientError::signing("Failed to sign ConnectQuoteProvider", error))?;
 
         Ok(format!("{}", signature))
     }

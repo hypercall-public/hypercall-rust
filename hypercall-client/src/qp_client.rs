@@ -140,13 +140,58 @@ impl std::fmt::Display for QpWriteFailure {
     }
 }
 
+/// Why the scoped runtime dropped an RFQ response instead of sending it.
+/// Surfaced through [`QpClientCallbacks::on_rfq_response_dropped`] alongside
+/// the message itself, so the caller can attribute the loss to the `rfq_id`
+/// it belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RfqDropReason {
+    /// The response's delivery deadline passed before it was written.
+    Expired,
+    /// The response was consumed for writing but the socket write failed.
+    WriteFailed,
+    /// The response was consumed for writing but the socket write timed out.
+    WriteTimeout,
+}
+
+impl RfqDropReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::WriteFailed => "write_failed",
+            Self::WriteTimeout => "write_timeout",
+        }
+    }
+}
+
+impl std::fmt::Display for RfqDropReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Callbacks for observability hooks. Implement this to wire in your own
 /// metrics framework (Prometheus, StatsD, etc.). The default [`NoopCallbacks`]
 /// does nothing.
 pub trait QpClientCallbacks: Send + Sync + 'static {
     fn on_connected(&self) {}
     fn on_disconnected(&self, _reason: QpDisconnectReason) {}
+    /// A bulk count of outbound messages discarded rather than sent. Both
+    /// runtimes report through this: the legacy client counts its pre-reconnect
+    /// drain, and the scoped runtime counts superseded indicative frames AND
+    /// dropped RFQ responses. It carries no identity, so a firm quote that
+    /// died here cannot be traced back to its `rfq_id` -- use
+    /// [`Self::on_rfq_response_dropped`] for that. The scoped runtime reports
+    /// every RFQ drop through BOTH hooks, so existing consumers of this count
+    /// see unchanged totals.
     fn on_stale_messages_drained(&self, _count: u64) {}
+    /// An RFQ response the scoped runtime could not deliver, with the message
+    /// itself so the loss can be attributed (its `rfq_id`, nonce, and legs
+    /// are all still present). A signed quote that never reaches the venue
+    /// usually needs a corrective audit event on the same `rfq_id`; the bare
+    /// count above cannot support that. Scoped runtime only -- the legacy
+    /// client has no per-message deadlines.
+    fn on_rfq_response_dropped(&self, _message: &ClientOutbound, _reason: RfqDropReason) {}
     fn on_inbound_message_dropped(&self) {}
     fn on_transport_activity(&self) {}
     fn on_write_failed(&self, _operation: QpWriteOperation, _failure: QpWriteFailure) {}

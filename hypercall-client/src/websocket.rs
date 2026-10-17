@@ -1,4 +1,8 @@
 //! WebSocket client for real-time market data and account-scoped updates.
+#![expect(
+    clippy::result_large_err,
+    reason = "websocket methods preserve the established unboxed public ClientError contract"
+)]
 //!
 //! Connects to the Hypercall WS endpoint (`/ws`) for streaming:
 //! - **Public**: orderbook, trades, index prices, options chain
@@ -30,9 +34,31 @@
 //! | `orderbook` | No | L2 orderbook updates (filterable by symbols) |
 //! | `trades` | No | Public trade events |
 //! | `index_prices` | No | Spot/index prices for all underlyings |
+//! | `indicative_market_data` | No | Aggregated quote-provider prices, one row per frame |
+//! | `indicative_market_data_v2` | No | The same prices in batch frames, see [`WsClient::subscribe_indicative_market_data`] |
 //! | `order_updates` | Yes | Order status changes (includes `instrument_type`) |
 //! | `fills` | Yes | Fill notifications (includes `instrument_type`) |
 //! | `portfolio` | Yes | Portfolio balance + position updates |
+//!
+//! # Compression
+//!
+//! The client offers RFC 7692 `permessage-deflate` on every connection. When the
+//! server accepts, compressed frames are inflated transparently, with the same
+//! size limit as uncompressed messages; when it does not, the connection runs
+//! uncompressed with identical JSON messages. Opt out with
+//! [`WsClient::with_permessage_deflate`].
+//!
+//! # Batched indicative market data
+//!
+//! [`WsClient::subscribe_indicative_market_data`] subscribes to
+//! `indicative_market_data_v2`, which delivers `IndicativeMarketDataBatch`
+//! frames, each carrying the rows of one short batch window. Servers that
+//! predate that channel confirm any channel name, so the client checks the
+//! confirmation: only `{"type":"Subscribed","channel":"indicative_market_data_v2","batch":true}`
+//! means the server batches. Any other confirmation makes the client switch
+//! that subscription to `indicative_market_data` (one row per frame) for the
+//! rest of the client's life. [`crate::indicative`] decodes both. Opt out
+//! with [`WsClient::with_batched_indicative`].
 
 use std::collections::BTreeMap;
 use std::sync::{
@@ -42,18 +68,48 @@ use std::sync::{
 
 use futures::{SinkExt, StreamExt};
 use sonic_rs::JsonValueTrait;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch, Mutex, RwLock};
 use tokio::time::Duration;
-use tokio_tungstenite::{connect_async, tungstenite};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::{client_async, tungstenite, WebSocketStream};
 use tracing::{debug, info, warn};
 
 use crate::error::{ClientError, Result};
+#[cfg(feature = "rfq-v2")]
+use crate::rfq_v2::encode_rfq_v2_read_grant;
 use crate::wallet::AccountAddress;
+#[cfg(feature = "rfq-v2")]
+use hypercall_sdk_types::rfq_v2::RfqV2ReadGrant;
 use hypercall_sdk_types::ws_protocol::WsMessage;
-use hypercall_ws_protocol::WsSlowConsumerCloseReason;
+use hypercall_ws_protocol::{WsChannel, WsSlowConsumerCloseReason};
+
+/// Original indicative channel: one `IndicativeMarketData` frame per row.
+const INDICATIVE_CHANNEL: &str = WsChannel::IndicativeMarketData.as_str();
+/// Batched indicative channel: `IndicativeMarketDataBatch` frames.
+const INDICATIVE_V2_CHANNEL: &str = WsChannel::IndicativeMarketDataV2.as_str();
+
+#[path = "websocket_deflate_io.rs"]
+mod deflate_io;
+
+use deflate_io::{InflatingStream, PERMESSAGE_DEFLATE_OFFER};
 
 const MAX_CONTROL_FRAME_PAYLOAD_LEN: usize = 125;
 const OUTBOUND_CONTROL_CAPACITY: usize = 256;
+/// Tungstenite's default frame limit. Inflated messages are re-framed in
+/// frames no larger than this.
+const MAX_FRAME_LEN: usize = 16 << 20;
+/// Tungstenite's default message limit, which also caps inflated messages.
+const MAX_MESSAGE_LEN: usize = 64 << 20;
+
+/// The byte stream under the WebSocket: plain TCP or native-tls over TCP.
+trait ClientIo: AsyncRead + AsyncWrite + Send + Unpin {}
+
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> ClientIo for T {}
+
+type ClientSocket = WebSocketStream<InflatingStream<Box<dyn ClientIo>>>;
 
 /// Reconnection and handshake policy for [`WsClient`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,7 +188,12 @@ impl WsRecoveryPlan {
                 self.rest_reconcile = true;
             }
             "order_updates" | "fills" | "liquidation" | "rfq" => self.rest_reconcile = true,
-            "indicative_market_data" | "index_prices" | "market_updates" => {}
+            #[cfg(feature = "rfq-v2")]
+            "rfq_v2" => self.rest_reconcile = true,
+            "indicative_market_data"
+            | "indicative_market_data_v2"
+            | "index_prices"
+            | "market_updates" => {}
             channel if channel.starts_with("candles") => {}
             _ => self.application_reconcile = true,
         }
@@ -174,8 +235,78 @@ impl WsConnectionState {
 #[derive(Debug, Clone)]
 struct DesiredSubscription {
     channel: String,
+    symbols: Option<Vec<String>>,
+    expiry: Option<String>,
+    option_type: Option<String>,
+    /// Owned by [`WsClient::subscribe_indicative_market_data`], so it may live
+    /// on either indicative channel after a fallback and is released by
+    /// [`WsClient::unsubscribe_indicative_market_data`].
+    logical_indicative: bool,
+    /// Owned by a direct subscribe ([`WsClient::subscribe_with_options`] and
+    /// friends) and released by [`WsClient::unsubscribe`]. A fallback can make
+    /// one entry carry both claims; it is removed when neither remains.
+    direct: bool,
     subscribe: String,
     unsubscribe: String,
+}
+
+fn canonical_symbols(symbols: Option<&[String]>) -> Option<std::collections::BTreeSet<String>> {
+    let set: std::collections::BTreeSet<String> = symbols?
+        .iter()
+        .map(|symbol| symbol.trim().to_uppercase())
+        .filter(|symbol| !symbol.is_empty())
+        .collect();
+    (!set.is_empty()).then_some(set)
+}
+
+impl DesiredSubscription {
+    /// Take over the ownership claims of an equivalent entry it replaces.
+    fn absorb(&mut self, other: &Self) {
+        self.logical_indicative |= other.logical_indicative;
+        self.direct |= other.direct;
+    }
+
+    /// Whether both entries describe the same channel and filter.
+    ///
+    /// Symbols compare the way the server stores them: trimmed, upper-cased,
+    /// as a set, with an empty list meaning no filter.
+    fn same_filter(&self, other: &Self) -> bool {
+        self.channel == other.channel
+            && canonical_symbols(self.symbols.as_deref())
+                == canonical_symbols(other.symbols.as_deref())
+            && self.expiry == other.expiry
+            && self.option_type == other.option_type
+    }
+
+    fn new(
+        channel: &str,
+        symbols: Option<Vec<String>>,
+        expiry: Option<String>,
+        option_type: Option<String>,
+    ) -> Result<Self> {
+        let subscribe = sonic_rs::to_string(&WsMessage::Subscribe {
+            channel: channel.to_string(),
+            symbols: symbols.clone(),
+            expiry: expiry.clone(),
+            option_type: option_type.clone(),
+        })?;
+        let unsubscribe = sonic_rs::to_string(&WsMessage::Unsubscribe {
+            channel: channel.to_string(),
+            symbols: symbols.clone(),
+            expiry: expiry.clone(),
+            option_type: option_type.clone(),
+        })?;
+        Ok(Self {
+            channel: channel.to_string(),
+            symbols,
+            expiry,
+            option_type,
+            logical_indicative: false,
+            direct: false,
+            subscribe,
+            unsubscribe,
+        })
+    }
 }
 
 struct WsClientShared {
@@ -187,13 +318,78 @@ struct WsClientShared {
     state_tx: watch::Sender<WsConnectionState>,
     last_disconnect: StdMutex<Option<WsDisconnectReason>>,
     started: AtomicBool,
+    /// Prefer `indicative_market_data_v2` for indicative subscriptions.
+    batched_indicative: AtomicBool,
+    /// Set once a server confirmed v2 without the batch marker: it does not
+    /// know the channel. Sticky for the client's life.
+    v2_unsupported: AtomicBool,
+    /// A v2 confirmation without the marker arrived and the switch to v1 has
+    /// not been applied yet.
+    v2_fallback_pending: AtomicBool,
+}
+
+/// What [`WsClient::release_where`] does with one stored subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Release {
+    Keep,
+    Remove,
+}
+
+/// What the client offers in the upgrade request.
+#[derive(Debug, Clone, Copy)]
+struct ConnectOptions {
+    permessage_deflate: bool,
 }
 
 /// WebSocket client for Hypercall.
 pub struct WsClient {
     shared: Arc<WsClientShared>,
     config: WsClientConfig,
+    options: ConnectOptions,
     shutdown_tx: StdMutex<Option<watch::Sender<bool>>>,
+}
+
+#[cfg(feature = "rfq-v2")]
+struct RfqV2SocketGrant {
+    token: String,
+    account: String,
+    expires_at_ms: u64,
+}
+
+/// The identity a session presents after every (re)connect.
+struct SessionCredentials {
+    wallet: Option<String>,
+    #[cfg(feature = "rfq-v2")]
+    rfq_v2_grant: Option<RfqV2SocketGrant>,
+}
+
+impl SessionCredentials {
+    fn wallet(wallet: Option<String>) -> Self {
+        Self {
+            wallet,
+            #[cfg(feature = "rfq-v2")]
+            rfq_v2_grant: None,
+        }
+    }
+
+    /// Wall-clock expiry of the session's RFQ V2 read grant, if it has one.
+    fn rfq_v2_expires_at_ms(&self) -> Option<u64> {
+        #[cfg(feature = "rfq-v2")]
+        {
+            self.rfq_v2_grant.as_ref().map(|grant| grant.expires_at_ms)
+        }
+        #[cfg(not(feature = "rfq-v2"))]
+        {
+            None
+        }
+    }
+}
+
+fn current_unix_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
 }
 
 impl WsClient {
@@ -215,10 +411,48 @@ impl WsClient {
                 state_tx,
                 last_disconnect: StdMutex::new(None),
                 started: AtomicBool::new(false),
+                batched_indicative: AtomicBool::new(true),
+                v2_unsupported: AtomicBool::new(false),
+                v2_fallback_pending: AtomicBool::new(false),
             }),
             config,
+            options: ConnectOptions {
+                permessage_deflate: true,
+            },
             shutdown_tx: StdMutex::new(None),
         }
+    }
+
+    /// Choose whether to offer RFC 7692 `permessage-deflate` when connecting.
+    ///
+    /// Enabled by default. The server decides whether to accept, and the client
+    /// works either way: compressed frames are inflated transparently, and the
+    /// JSON messages are identical. Disable it to save the CPU spent inflating,
+    /// or to rule compression out while debugging. The setting applies to the
+    /// initial connection and every reconnect.
+    pub fn with_permessage_deflate(mut self, enabled: bool) -> Self {
+        self.options.permessage_deflate = enabled;
+        self
+    }
+
+    /// Choose whether [`WsClient::subscribe_indicative_market_data`] uses
+    /// the batched `indicative_market_data_v2` channel.
+    ///
+    /// Enabled by default: fewer frames, rows up to one short batch window
+    /// later, and much better compression. Disable it to receive one
+    /// `IndicativeMarketData` frame per row from `indicative_market_data`.
+    pub fn with_batched_indicative(self, enabled: bool) -> Self {
+        self.shared
+            .batched_indicative
+            .store(enabled, Ordering::Release);
+        self
+    }
+
+    /// Whether indicative subscriptions are currently delivered in batches:
+    /// batching is enabled and no server has shown it lacks the v2 channel.
+    pub fn indicative_batched(&self) -> bool {
+        self.shared.batched_indicative.load(Ordering::Acquire)
+            && !self.shared.v2_unsupported.load(Ordering::Acquire)
     }
 
     /// Connect to the WebSocket endpoint.
@@ -229,6 +463,33 @@ impl WsClient {
     /// and restores desired subscriptions until [`WsClient::disconnect`] is called
     /// or the client is dropped.
     pub async fn connect(&self, base_url: &str, wallet: Option<&AccountAddress>) -> Result<()> {
+        self.start_session(
+            base_url,
+            SessionCredentials::wallet(wallet.map(ToString::to_string)),
+        )
+        .await
+    }
+
+    /// Connect using a signed private RFQ read grant. The grant is sent again
+    /// before subscriptions on reconnect. Once it expires, sign a fresh grant
+    /// and create a new session; no unsigned wallet identity grants RFQ access.
+    #[cfg(feature = "rfq-v2")]
+    pub async fn connect_rfq_v2(&self, base_url: &str, grant: &RfqV2ReadGrant) -> Result<()> {
+        self.start_session(
+            base_url,
+            SessionCredentials {
+                wallet: None,
+                rfq_v2_grant: Some(RfqV2SocketGrant {
+                    token: encode_rfq_v2_read_grant(grant)?,
+                    account: grant.account.to_string(),
+                    expires_at_ms: grant.expires_at_ms,
+                }),
+            },
+        )
+        .await
+    }
+
+    async fn start_session(&self, base_url: &str, credentials: SessionCredentials) -> Result<()> {
         self.config.validate()?;
         let ws_url = websocket_url(base_url)?;
         if self
@@ -248,11 +509,20 @@ impl WsClient {
             .lock()
             .expect("WebSocket shutdown mutex poisoned") = Some(shutdown_tx);
         let (initial_tx, initial_rx) = oneshot::channel();
-        let wallet = wallet.map(ToString::to_string);
         let shared = self.shared.clone();
         let config = self.config;
+        let options = self.options;
         tokio::spawn(async move {
-            run_ws_session(shared, config, ws_url, wallet, shutdown_rx, initial_tx).await;
+            run_ws_session(
+                shared,
+                config,
+                ws_url,
+                options,
+                credentials,
+                shutdown_rx,
+                initial_tx,
+            )
+            .await;
         });
 
         initial_rx.await.map_err(|_| {
@@ -321,6 +591,22 @@ impl WsClient {
         Ok(())
     }
 
+    /// Send a subscription request for private RFQ V2 change hints. `Ok` means
+    /// the frame was sent; observe `Subscribed` or `Error` for server acceptance.
+    /// Use a periodic signed change-feed read to recover hints lost while a
+    /// socket stays connected.
+    #[cfg(feature = "rfq-v2")]
+    pub async fn subscribe_rfq_v2(&self) -> Result<()> {
+        self.subscribe_with_options("rfq_v2", None, None, None)
+            .await
+    }
+
+    /// Remove the RFQ V2 subscription, including its reconnect intent.
+    #[cfg(feature = "rfq-v2")]
+    pub async fn unsubscribe_rfq_v2(&self) -> Result<()> {
+        self.unsubscribe(vec!["rfq_v2"]).await
+    }
+
     /// Subscribe to a channel and retain its filters across reconnects.
     pub async fn subscribe_with_options(
         &self,
@@ -329,34 +615,100 @@ impl WsClient {
         expiry: Option<String>,
         option_type: Option<String>,
     ) -> Result<()> {
+        self.subscribe_desired(channel, symbols, expiry, option_type)
+            .await
+    }
+
+    /// Subscribe to indicative market data and retain the subscription
+    /// across reconnects.
+    ///
+    /// By default this uses `indicative_market_data_v2`, whose
+    /// `IndicativeMarketDataBatch` frames carry the rows of one short batch
+    /// window. If the server confirms v2 without `"batch": true` (it predates
+    /// the channel), the client switches to `indicative_market_data`, one
+    /// `IndicativeMarketData` frame per row. Read rows with
+    /// [`crate::indicative::indicative_rows_from_value`], which handles both.
+    ///
+    /// The server keeps one symbol filter per channel per connection: every
+    /// `Subscribe` adds symbols to it, and a filtered subscribe narrows an
+    /// unfiltered one. If you also subscribe to `indicative_market_data`
+    /// directly with a different filter, a fallback onto v1 shares that one
+    /// server filter with your direct subscription. Use one or the other per
+    /// connection when exact filters matter.
+    pub async fn subscribe_indicative_market_data(
+        &self,
+        symbols: Option<Vec<String>>,
+    ) -> Result<()> {
+        let channel = if self.indicative_batched() {
+            INDICATIVE_V2_CHANNEL
+        } else {
+            INDICATIVE_CHANNEL
+        };
+        self.subscribe_desired_with(channel, symbols, None, None, true)
+            .await
+    }
+
+    /// Stop the subscriptions made by
+    /// [`WsClient::subscribe_indicative_market_data`], on whichever channel
+    /// each resolved to after a fallback, and stop restoring them after
+    /// reconnects. Subscriptions made with [`WsClient::subscribe_with_options`]
+    /// on either indicative channel are left alone.
+    pub async fn unsubscribe_indicative_market_data(&self) -> Result<()> {
+        self.release_where(|subscription| {
+            if !subscription.logical_indicative {
+                return Release::Keep;
+            }
+            subscription.logical_indicative = false;
+            if subscription.direct {
+                Release::Keep
+            } else {
+                Release::Remove
+            }
+        })
+        .await
+    }
+
+    async fn subscribe_desired(
+        &self,
+        channel: &str,
+        symbols: Option<Vec<String>>,
+        expiry: Option<String>,
+        option_type: Option<String>,
+    ) -> Result<()> {
+        self.subscribe_desired_with(channel, symbols, expiry, option_type, false)
+            .await
+    }
+
+    async fn subscribe_desired_with(
+        &self,
+        channel: &str,
+        symbols: Option<Vec<String>>,
+        expiry: Option<String>,
+        option_type: Option<String>,
+        logical_indicative: bool,
+    ) -> Result<()> {
         if !self.shared.started.load(Ordering::Acquire) {
             return Err(ClientError::WebSocket("Not connected".to_string()));
         }
 
-        let subscribe = WsMessage::Subscribe {
-            channel: channel.to_string(),
-            symbols: symbols.clone(),
-            expiry: expiry.clone(),
-            option_type: option_type.clone(),
-        };
-        let unsubscribe = WsMessage::Unsubscribe {
-            channel: channel.to_string(),
-            symbols,
-            expiry,
-            option_type,
-        };
-        let desired = DesiredSubscription {
-            channel: channel.to_string(),
-            subscribe: sonic_rs::to_string(&subscribe)?,
-            unsubscribe: sonic_rs::to_string(&unsubscribe)?,
-        };
+        let mut desired = DesiredSubscription::new(channel, symbols, expiry, option_type)?;
+        desired.logical_indicative = logical_indicative;
+        desired.direct = !logical_indicative;
         let frame = tungstenite::Message::Text(desired.subscribe.clone());
-        let subscription_key = desired.subscribe.clone();
-        self.shared
-            .subscriptions
-            .write()
-            .await
-            .insert(subscription_key, desired);
+        {
+            let mut subscriptions = self.shared.subscriptions.write().await;
+            // One logical subscription is one channel plus its filter fields.
+            // Replace any equivalent earlier entry so a reconnect replays it
+            // (and its subscribe-time snapshot) once.
+            // Keep any ownership claim the equivalent entry already had.
+            for existing in subscriptions.values() {
+                if desired.same_filter(existing) {
+                    desired.absorb(existing);
+                }
+            }
+            subscriptions.retain(|_, existing| !desired.same_filter(existing));
+            subscriptions.insert(desired.subscribe.clone(), desired);
+        }
 
         let tx = self
             .shared
@@ -375,35 +727,67 @@ impl WsClient {
     }
 
     /// Unsubscribe from channels and stop restoring them after reconnects.
+    ///
+    /// Channels match exactly, and only subscriptions made directly (for
+    /// example with [`WsClient::subscribe_with_options`]) are released. To
+    /// stop a subscription made by
+    /// [`WsClient::subscribe_indicative_market_data`], which may have moved
+    /// from `indicative_market_data_v2` to `indicative_market_data`, use
+    /// [`WsClient::unsubscribe_indicative_market_data`]. If both own the same
+    /// channel and filter, the server subscription ends when both release it.
     pub async fn unsubscribe(&self, channels: Vec<&str>) -> Result<()> {
+        for channel in channels {
+            // Releases the direct claim; an entry the indicative helper also
+            // owns stays subscribed until that claim is released too.
+            self.release_where(|subscription| {
+                if subscription.channel != channel {
+                    return Release::Keep;
+                }
+                subscription.direct = false;
+                if subscription.logical_indicative {
+                    Release::Keep
+                } else {
+                    Release::Remove
+                }
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Apply `release` to every stored subscription and unsubscribe the ones
+    /// it says to remove.
+    async fn release_where(
+        &self,
+        release: impl Fn(&mut DesiredSubscription) -> Release,
+    ) -> Result<()> {
         if !self.shared.started.load(Ordering::Acquire) {
             return Err(ClientError::WebSocket("Not connected".to_string()));
         }
 
-        for channel in channels {
-            let removed = {
-                let mut subscriptions = self.shared.subscriptions.write().await;
-                let keys = subscriptions
-                    .iter()
-                    .filter(|(_, subscription)| subscription.channel == channel)
-                    .map(|(key, _)| key.clone())
-                    .collect::<Vec<_>>();
-                keys.into_iter()
-                    .filter_map(|key| subscriptions.remove(&key))
-                    .collect::<Vec<_>>()
-            };
-            for removed in removed {
-                let tx = self
-                    .shared
-                    .tx
-                    .lock()
-                    .expect("WebSocket sender mutex poisoned")
-                    .clone();
-                if let Some(tx) = tx {
-                    tx.send(tungstenite::Message::Text(removed.unsubscribe))
-                        .await
-                        .map_err(|e| ClientError::WebSocket(format!("Failed to send: {}", e)))?;
-                }
+        let removed = {
+            let mut subscriptions = self.shared.subscriptions.write().await;
+            let keys = subscriptions
+                .iter_mut()
+                .filter_map(|(key, subscription)| {
+                    (release(subscription) == Release::Remove).then(|| key.clone())
+                })
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| subscriptions.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        for removed in removed {
+            let tx = self
+                .shared
+                .tx
+                .lock()
+                .expect("WebSocket sender mutex poisoned")
+                .clone();
+            if let Some(tx) = tx {
+                tx.send(tungstenite::Message::Text(removed.unsubscribe))
+                    .await
+                    .map_err(|e| ClientError::WebSocket(format!("Failed to send: {}", e)))?;
             }
         }
         Ok(())
@@ -587,6 +971,66 @@ fn websocket_url(base_url: &str) -> Result<String> {
     }
 }
 
+/// Why opening a WebSocket connection failed, with the source kept until the
+/// session renders it at the existing `ClientError::WebSocket` boundary.
+#[derive(Debug, thiserror::Error)]
+#[displaystr::display]
+enum ConnectError {
+    Url(#[source] tungstenite::Error) = "invalid WebSocket URL: {_0}",
+    MissingHost = "WebSocket URL has no host",
+    UnsupportedScheme = "WebSocket URL must use ws or wss",
+    Tcp(#[source] std::io::Error) = "IO error: {_0}",
+    Tls(#[source] tokio_native_tls::native_tls::Error) = "TLS error: {_0}",
+    /// The upgrade handshake stage. Named rather than transparent because it
+    /// adds a stage to the Tungstenite error; the text is unchanged.
+    Handshake(#[source] tungstenite::Error) = "{_0}",
+}
+
+/// Opens TCP, then native-tls for `wss` (the platform trust store, as before),
+/// then runs the Tungstenite handshake over [`InflatingStream`].
+async fn connect_socket(
+    ws_url: &str,
+    options: ConnectOptions,
+) -> std::result::Result<(ClientSocket, tungstenite::handshake::client::Response), ConnectError> {
+    let permessage_deflate = options.permessage_deflate;
+    let mut request = ws_url.into_client_request().map_err(ConnectError::Url)?;
+    if permessage_deflate {
+        request.headers_mut().insert(
+            "Sec-WebSocket-Extensions",
+            HeaderValue::from_static(PERMESSAGE_DEFLATE_OFFER),
+        );
+    }
+    let uri = request.uri();
+    let host = uri.host().ok_or(ConnectError::MissingHost)?.to_string();
+    let tls = match uri.scheme_str() {
+        Some("wss") => true,
+        Some("ws") => false,
+        _ => return Err(ConnectError::UnsupportedScheme),
+    };
+    let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
+    let tcp = TcpStream::connect(format!("{host}:{port}"))
+        .await
+        .map_err(ConnectError::Tcp)?;
+
+    let io: Box<dyn ClientIo> = if tls {
+        let domain = host.trim_start_matches('[').trim_end_matches(']');
+        let connector =
+            tokio_native_tls::native_tls::TlsConnector::new().map_err(ConnectError::Tls)?;
+        let stream = tokio_native_tls::TlsConnector::from(connector)
+            .connect(domain, tcp)
+            .await
+            .map_err(ConnectError::Tls)?;
+        Box::new(stream)
+    } else {
+        Box::new(tcp)
+    };
+
+    let stream = InflatingStream::new(io, permessage_deflate, MAX_FRAME_LEN, MAX_MESSAGE_LEN);
+    client_async(request, stream)
+        .await
+        .map_err(ConnectError::Handshake)
+}
+
 fn reconnect_delay(config: WsClientConfig, attempt: u32) -> Duration {
     let multiplier = 1_u32 << attempt.min(31);
     let ceiling = config
@@ -617,8 +1061,128 @@ fn record_disconnect(shared: &WsClientShared, reason: WsDisconnectReason) {
 async fn record_text(shared: &WsClientShared, text: &str) -> Option<sonic_rs::Value> {
     debug!("WS received: {}", text);
     let json = sonic_rs::from_str::<sonic_rs::Value>(text).ok()?;
+    if is_unbatched_v2_confirmation(&json) {
+        // The server accepted the name but does not know the channel, so no
+        // data would ever arrive on it. Switch to v1 at the next safe point.
+        warn!("server lacks indicative_market_data_v2; falling back to indicative_market_data");
+        shared.v2_unsupported.store(true, Ordering::Release);
+        shared.v2_fallback_pending.store(true, Ordering::Release);
+    }
     shared.messages.lock().await.push(json.clone());
     Some(json)
+}
+
+/// The server cannot deliver `indicative_market_data_v2`: it confirmed the
+/// channel without `"batch": true` (servers that predate the channel confirm
+/// any name), or it rejected the channel as unknown.
+fn is_unbatched_v2_confirmation(json: &sonic_rs::Value) -> bool {
+    let channel_is_v2 =
+        json.get("channel").and_then(|value| value.as_str()) == Some(INDICATIVE_V2_CHANNEL);
+    match json.get("type").and_then(|value| value.as_str()) {
+        Some("Subscribed") => {
+            channel_is_v2 && json.get("batch").and_then(|value| value.as_bool()) != Some(true)
+        }
+        Some("Error") => {
+            channel_is_v2
+                && json.get("code").and_then(|value| value.as_str())
+                    == Some(hypercall_ws_protocol::UNKNOWN_CHANNEL_CODE)
+        }
+        _ => false,
+    }
+}
+
+/// Move every v2 subscription made by
+/// [`WsClient::subscribe_indicative_market_data`] to v1 with the same filter.
+/// Subscriptions made directly on `indicative_market_data_v2` are the
+/// caller's to manage and are left alone. Returns
+/// the `Unsubscribe` frames for the dead v2 subscriptions and the new v1
+/// entries, which the caller subscribes (and, during a reconnect, waits for).
+async fn take_v2_fallback(
+    shared: &WsClientShared,
+) -> std::result::Result<(Vec<String>, BTreeMap<String, DesiredSubscription>), SessionStop> {
+    let mut subscriptions = shared.subscriptions.write().await;
+    take_v2_fallback_locked(shared, &mut subscriptions)
+}
+
+/// [`take_v2_fallback`] under a guard the caller already holds, so it can keep
+/// holding it while the replacements are subscribed.
+fn take_v2_fallback_locked(
+    shared: &WsClientShared,
+    subscriptions: &mut BTreeMap<String, DesiredSubscription>,
+) -> std::result::Result<(Vec<String>, BTreeMap<String, DesiredSubscription>), SessionStop> {
+    let mut unsubscribes = Vec::new();
+    let mut replacements = BTreeMap::new();
+    if !shared.v2_fallback_pending.swap(false, Ordering::AcqRel) {
+        return Ok((unsubscribes, replacements));
+    }
+    let v2_keys: Vec<String> = subscriptions
+        .iter()
+        .filter(|(_, desired)| {
+            desired.channel == INDICATIVE_V2_CHANNEL && desired.logical_indicative
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in v2_keys {
+        let Some(mut v2) = subscriptions.remove(&key) else {
+            continue;
+        };
+        if v2.direct {
+            // A direct claim on the same v2 entry is the caller's to manage:
+            // keep it (and the server subscription) and move only the
+            // helper's claim to v1.
+            v2.logical_indicative = false;
+            subscriptions.insert(key, v2.clone());
+        } else {
+            unsubscribes.push(v2.unsubscribe.clone());
+        }
+        let mut v1 = DesiredSubscription::new(
+            INDICATIVE_CHANNEL,
+            v2.symbols.clone(),
+            v2.expiry.clone(),
+            v2.option_type.clone(),
+        )
+        .map_err(|error| {
+            SessionStop::Disconnected(WsDisconnectReason::Protocol(error.to_string()))
+        })?;
+        v1.logical_indicative = true;
+        // A direct v1 subscription with the same filter keeps its claim: the
+        // merged entry stays until both owners release it.
+        for existing in subscriptions.values() {
+            if v1.same_filter(existing) {
+                v1.absorb(existing);
+            }
+        }
+        subscriptions.retain(|_, existing| !v1.same_filter(existing));
+        subscriptions.insert(v1.subscribe.clone(), v1.clone());
+        replacements.insert(v1.subscribe.clone(), v1);
+    }
+    Ok((unsubscribes, replacements))
+}
+
+/// Steady-state fallback: switch v2 subscriptions to v1 on the live socket.
+/// Their confirmations are recorded like any other message.
+async fn apply_v2_fallback<S>(
+    socket: &mut S,
+    shared: &WsClientShared,
+) -> std::result::Result<(), SessionStop>
+where
+    S: futures::Sink<tungstenite::Message, Error = tungstenite::Error> + Unpin,
+{
+    let (unsubscribes, replacements) = take_v2_fallback(shared).await?;
+    let frames = unsubscribes.into_iter().chain(
+        replacements
+            .into_values()
+            .map(|replacement| replacement.subscribe),
+    );
+    for frame in frames {
+        socket
+            .send(tungstenite::Message::Text(frame))
+            .await
+            .map_err(|error| {
+                SessionStop::Disconnected(WsDisconnectReason::Transport(error.to_string()))
+            })?;
+    }
+    Ok(())
 }
 
 fn disconnect_reason_from_close(
@@ -742,6 +1306,107 @@ where
     }
 }
 
+#[cfg(feature = "rfq-v2")]
+async fn authenticate_rfq_v2_socket<S>(
+    socket: &mut S,
+    shared: &WsClientShared,
+    grant: &RfqV2SocketGrant,
+    shutdown_rx: &mut watch::Receiver<bool>,
+    timeout: Duration,
+) -> std::result::Result<(), SessionStop>
+where
+    S: futures::Sink<tungstenite::Message, Error = tungstenite::Error>
+        + futures::Stream<Item = std::result::Result<tungstenite::Message, tungstenite::Error>>
+        + Unpin,
+{
+    let auth_msg = sonic_rs::to_string(&WsMessage::AuthenticateRfqV2 {
+        token: grant.token.clone(),
+    })
+    .map_err(|error| {
+        SessionStop::NonReconnectable(WsDisconnectReason::Protocol(format!(
+            "failed to serialize RFQ authentication: {error}"
+        )))
+    })?;
+    socket
+        .send(tungstenite::Message::Text(auth_msg))
+        .await
+        .map_err(|error| {
+            SessionStop::Disconnected(WsDisconnectReason::Transport(error.to_string()))
+        })?;
+
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    return Err(SessionStop::Shutdown);
+                }
+            }
+            _ = &mut deadline => {
+                return Err(SessionStop::Disconnected(WsDisconnectReason::Protocol(
+                    "timed out waiting for RFQ authentication response".to_string(),
+                )));
+            }
+            incoming = socket.next() => {
+                match incoming {
+                    Some(Ok(tungstenite::Message::Text(text))) => {
+                        let Some(json) = record_text(shared, &text).await else {
+                            continue;
+                        };
+                        match json.get("type").and_then(|value| value.as_str()) {
+                            Some("RfqV2Authenticated") => {
+                                let account = json
+                                    .get("account")
+                                    .and_then(|value| value.as_str())
+                                    .ok_or_else(|| SessionStop::NonReconnectable(
+                                        WsDisconnectReason::Protocol(
+                                            "RFQ authentication response omitted account".to_string(),
+                                        )
+                                    ))?;
+                                if !account.eq_ignore_ascii_case(&grant.account) {
+                                    return Err(SessionStop::NonReconnectable(
+                                        WsDisconnectReason::Protocol(
+                                            "RFQ authenticated account does not match signed grant".to_string(),
+                                        ),
+                                    ));
+                                }
+                                return Ok(());
+                            }
+                            Some("Error") => {
+                                let message = json
+                                    .get("message")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("RFQ authentication failed");
+                                return Err(SessionStop::NonReconnectable(
+                                    WsDisconnectReason::Protocol(message.to_string()),
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(Ok(tungstenite::Message::Ping(payload))) => {
+                        socket.send(tungstenite::Message::Pong(payload)).await.map_err(|error| {
+                            SessionStop::Disconnected(WsDisconnectReason::Transport(error.to_string()))
+                        })?;
+                    }
+                    Some(Ok(tungstenite::Message::Pong(payload))) => {
+                        shared.pongs.lock().await.push(payload);
+                    }
+                    Some(Ok(tungstenite::Message::Close(frame))) => {
+                        return Err(SessionStop::Disconnected(disconnect_reason_from_close(frame)));
+                    }
+                    Some(Err(error)) => {
+                        return Err(SessionStop::Disconnected(WsDisconnectReason::Transport(error.to_string())));
+                    }
+                    None => return Err(SessionStop::Disconnected(WsDisconnectReason::EndOfStream)),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 async fn replay_subscriptions<S>(
     socket: &mut S,
     shared: &WsClientShared,
@@ -790,6 +1455,23 @@ where
                         let Some(json) = record_text(shared, &text).await else {
                             continue;
                         };
+                        // Whether a v2 refusal (unmarked confirmation or
+                        // `unknown_channel`) can be absorbed by the logical fallback.
+                        // It cannot say which v2 request it answers, so any direct
+                        // v2 subscription being restored makes it a failure.
+                        let v2_refusal = is_unbatched_v2_confirmation(&json);
+                        let v2_all_logical = subscriptions
+                            .values()
+                            .filter(|desired| desired.channel == INDICATIVE_V2_CHANNEL)
+                            .all(|desired| desired.logical_indicative && !desired.direct);
+                        if v2_refusal && !v2_all_logical {
+                            return Err(SessionStop::NonReconnectable(
+                                WsDisconnectReason::Protocol(format!(
+                                    "server does not support {INDICATIVE_V2_CHANNEL}; \
+                                     direct subscriptions to it cannot be restored"
+                                )),
+                            ));
+                        }
                         match json.get("type").and_then(|value| value.as_str()) {
                             Some("Subscribed") => {
                                 if let Some(channel) = json.get("channel").and_then(|value| value.as_str()) {
@@ -798,6 +1480,16 @@ where
                                         if *count == 0 {
                                             pending.remove(channel);
                                         }
+                                    }
+                                }
+                            }
+                            // A logical v2 subscription rejected by the server falls
+                            // back to v1 once replay finishes.
+                            Some("Error") if v2_refusal => {
+                                if let Some(count) = pending.get_mut(INDICATIVE_V2_CHANNEL) {
+                                    *count -= 1;
+                                    if *count == 0 {
+                                        pending.remove(INDICATIVE_V2_CHANNEL);
                                     }
                                 }
                             }
@@ -843,14 +1535,30 @@ async fn run_connected_socket<S>(
     shared: &WsClientShared,
     outbound_rx: &mut mpsc::Receiver<tungstenite::Message>,
     shutdown_rx: &mut watch::Receiver<bool>,
+    rfq_v2_expires_at_ms: Option<u64>,
 ) -> SessionStop
 where
     S: futures::Sink<tungstenite::Message, Error = tungstenite::Error>
         + futures::Stream<Item = std::result::Result<tungstenite::Message, tungstenite::Error>>
         + Unpin,
 {
+    let grant_expiry = async {
+        if let Some(expires_at_ms) = rfq_v2_expires_at_ms {
+            let remaining_ms = current_unix_ms().map_or(0, |now| expires_at_ms.saturating_sub(now));
+            tokio::time::sleep(Duration::from_millis(remaining_ms)).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(grant_expiry);
     loop {
         tokio::select! {
+            _ = &mut grant_expiry => {
+                let _ = socket.send(tungstenite::Message::Close(None)).await;
+                return SessionStop::NonReconnectable(WsDisconnectReason::Protocol(
+                    "RFQ V2 read grant expired; sign a fresh grant".to_string(),
+                ));
+            }
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
                     let _ = socket.send(tungstenite::Message::Close(None)).await;
@@ -871,6 +1579,9 @@ where
                 match incoming {
                     Some(Ok(tungstenite::Message::Text(text))) => {
                         let _ = record_text(shared, &text).await;
+                        if let Err(stop) = apply_v2_fallback(socket, shared).await {
+                            return stop;
+                        }
                     }
                     Some(Ok(tungstenite::Message::Ping(payload))) => {
                         if let Err(error) = socket.send(tungstenite::Message::Pong(payload)).await {
@@ -902,7 +1613,8 @@ async fn run_ws_session(
     shared: Arc<WsClientShared>,
     config: WsClientConfig,
     ws_url: String,
-    wallet: Option<String>,
+    options: ConnectOptions,
+    credentials: SessionCredentials,
     mut shutdown_rx: watch::Receiver<bool>,
     initial_tx: oneshot::Sender<Result<()>>,
 ) {
@@ -925,6 +1637,21 @@ async fn run_ws_session(
             }
         }
 
+        if credentials
+            .rfq_v2_expires_at_ms()
+            .is_some_and(|expires_at_ms| current_unix_ms().is_none_or(|now| now >= expires_at_ms))
+        {
+            let reason = WsDisconnectReason::Protocol(
+                "RFQ V2 read grant expired; sign a fresh grant".to_string(),
+            );
+            record_disconnect(&shared, reason.clone());
+            finish_session(&shared);
+            if let Some(initial_tx) = initial_tx.take() {
+                let _ = initial_tx.send(Err(ClientError::WebSocket(format!("{reason:?}"))));
+            }
+            return;
+        }
+
         set_state(&shared, WsConnectionState::Connecting { attempt });
         debug!("Connecting to WebSocket: {}", ws_url);
         let connect_result = tokio::select! {
@@ -940,7 +1667,7 @@ async fn run_ws_session(
                 }
                 continue;
             }
-            result = connect_async(&ws_url) => result,
+            result = connect_socket(&ws_url, options) => result,
         };
 
         let (mut socket, response) = match connect_result {
@@ -962,10 +1689,14 @@ async fn run_ws_session(
                 continue;
             }
         };
-        info!("WebSocket connected, status: {}", response.status());
+        info!(
+            permessage_deflate = socket.get_ref().deflate_negotiated(),
+            "WebSocket connected, status: {}",
+            response.status()
+        );
 
         let handshake_result = async {
-            if let Some(wallet) = wallet.as_deref() {
+            if let Some(wallet) = credentials.wallet.as_deref() {
                 set_state(&shared, WsConnectionState::Authenticating);
                 authenticate_socket(
                     &mut socket,
@@ -978,7 +1709,24 @@ async fn run_ws_session(
                 info!("WebSocket authenticated as wallet: {}", wallet);
             }
 
-            let subscriptions = shared.subscriptions.read().await;
+            #[cfg(feature = "rfq-v2")]
+            if let Some(grant) = credentials.rfq_v2_grant.as_ref() {
+                set_state(&shared, WsConnectionState::Authenticating);
+                authenticate_rfq_v2_socket(
+                    &mut socket,
+                    &shared,
+                    grant,
+                    &mut shutdown_rx,
+                    config.authentication_timeout,
+                )
+                .await?;
+            }
+
+            // One write guard from the first replay until the sender is
+            // published: a subscribe or unsubscribe from another task waits
+            // and then runs against the live socket, so nothing it changes is
+            // missed by the replay or the v2 fallback below.
+            let mut subscriptions = shared.subscriptions.write().await;
             if !subscriptions.is_empty() {
                 set_state(
                     &shared,
@@ -990,6 +1738,29 @@ async fn run_ws_session(
                     &mut socket,
                     &shared,
                     &subscriptions,
+                    &mut shutdown_rx,
+                    config.subscription_timeout,
+                )
+                .await?;
+            }
+            // A v2 confirmation without the marker during replay: switch
+            // those subscriptions to v1, and wait for the v1 confirmations
+            // like the rest of the replay, before reporting the session ready.
+            let (unsubscribes, replacements) =
+                take_v2_fallback_locked(&shared, &mut subscriptions)?;
+            for frame in unsubscribes {
+                socket
+                    .send(tungstenite::Message::Text(frame))
+                    .await
+                    .map_err(|error| {
+                        SessionStop::Disconnected(WsDisconnectReason::Transport(error.to_string()))
+                    })?;
+            }
+            if !replacements.is_empty() {
+                replay_subscriptions(
+                    &mut socket,
+                    &shared,
+                    &replacements,
                     &mut shutdown_rx,
                     config.subscription_timeout,
                 )
@@ -1058,7 +1829,15 @@ async fn run_ws_session(
         reconnecting = true;
         let connected_at = tokio::time::Instant::now();
 
-        match run_connected_socket(&mut socket, &shared, &mut outbound_rx, &mut shutdown_rx).await {
+        match run_connected_socket(
+            &mut socket,
+            &shared,
+            &mut outbound_rx,
+            &mut shutdown_rx,
+            credentials.rfq_v2_expires_at_ms(),
+        )
+        .await
+        {
             SessionStop::Shutdown => {
                 finish_session(&shared);
                 return;
@@ -1091,6 +1870,10 @@ impl Default for WsClient {
 #[cfg(test)]
 #[path = "websocket_reconnect_test.rs"]
 mod reconnect_tests;
+
+#[cfg(test)]
+#[path = "websocket_deflate_test.rs"]
+mod deflate_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1320,7 +2103,7 @@ mod tests {
         let json = r#"{"type": "Subscribed", "channel": "orders"}"#;
         let msg: WsMessage = sonic_rs::from_str(json).unwrap();
         match msg {
-            WsMessage::Subscribed { channel } => assert_eq!(channel, "orders"),
+            WsMessage::Subscribed { channel, .. } => assert_eq!(channel, "orders"),
             _ => panic!("Expected Subscribed variant"),
         }
     }
@@ -1340,7 +2123,7 @@ mod tests {
         let json = r#"{"type": "Error", "message": "invalid channel"}"#;
         let msg: WsMessage = sonic_rs::from_str(json).unwrap();
         match msg {
-            WsMessage::Error { message } => assert_eq!(message, "invalid channel"),
+            WsMessage::Error { message, .. } => assert_eq!(message, "invalid channel"),
             _ => panic!("Expected Error variant"),
         }
     }
@@ -1371,11 +2154,13 @@ mod tests {
     #[test]
     fn test_ws_message_clone() {
         let msg = WsMessage::Error {
+            code: None,
+            channel: None,
             message: "test error".to_string(),
         };
         let cloned = msg.clone();
         match cloned {
-            WsMessage::Error { message } => assert_eq!(message, "test error"),
+            WsMessage::Error { message, .. } => assert_eq!(message, "test error"),
             _ => panic!("Clone failed"),
         }
     }
