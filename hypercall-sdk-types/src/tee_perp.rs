@@ -319,17 +319,24 @@ pub enum TeePerpOrderStage {
     /// The venue may have received the action. Reconcile before retrying
     /// with a new nonce; never resubmit through another route.
     Unknown,
+    /// Batch modify only: the venue answered every child definitively, some
+    /// accepted and some rejected. Each child's own stage says which.
+    Partial,
     /// A stage this SDK version does not know. Reconcile as for `Unknown`.
     #[serde(other)]
     Unrecognized,
 }
 
 impl TeePerpOrderStage {
-    /// Whether the outcome is definitive (`accepted`, `rejected`, or
-    /// `not_submitted`). Anything else may have reached the venue and must be
-    /// reconciled from venue state before acting on the same order again.
+    /// Whether the outcome is definitive (`accepted`, `rejected`,
+    /// `not_submitted`, or a batch's `partial`). Anything else may have
+    /// reached the venue and must be reconciled from venue state before
+    /// acting on the same order again.
     pub const fn is_definitive(self) -> bool {
-        matches!(self, Self::Accepted | Self::Rejected | Self::NotSubmitted)
+        matches!(
+            self,
+            Self::Accepted | Self::Rejected | Self::NotSubmitted | Self::Partial
+        )
     }
 }
 
@@ -667,13 +674,41 @@ pub struct TeePerpLeverageResponse {
 }
 tee_perp_outcome_helpers!(TeePerpLeverageResponse);
 
+/// What rests at the venue under a modified order's cloid after the call,
+/// read from the Hyperliquid response the server verified against
+/// `venueResponseHash`. The modify response is returned only after
+/// Hyperliquid answered, so trust it over an immediate `orderStatus` read,
+/// which can lag the venue by seconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum TeePerpModifyVenueOrder {
+    /// The replacement rests under this NEW order ID; the old one is gone.
+    Resting { oid: u64 },
+    /// The replacement filled on placement.
+    #[serde(rename_all = "camelCase")]
+    Filled {
+        oid: u64,
+        total_sz: String,
+        avg_px: String,
+    },
+    /// Hyperliquid cancelled the original order and then failed to place the
+    /// replacement: nothing rests under the cloid. `reason` is
+    /// `modify rejected; venue cancelled original`.
+    Cancelled { reason: String },
+    /// A status this SDK version does not know.
+    #[serde(other)]
+    Unrecognized,
+}
+
 /// Response of [`TEE_PERP_ORDER_MODIFY_ROUTE`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TeePerpModifyResponse {
     /// `accepted`: the venue applied the replacement. `rejected`: the venue
-    /// (or engine) refused it and the earlier order still rests.
-    /// `not_submitted`: nothing reached the venue. `unknown`: reconcile.
+    /// (or engine) refused it; the earlier order still rests unless
+    /// [`Self::venue_order`] is `Cancelled`. `not_submitted`: nothing reached
+    /// the venue. `unknown`: reconcile.
     pub stage: TeePerpOrderStage,
     #[serde(default)]
     pub error_code: Option<TeePerpErrorCode>,
@@ -697,8 +732,22 @@ pub struct TeePerpModifyResponse {
     pub message: Option<String>,
     #[serde(default)]
     pub reason_code: Option<PerpRejectionReasonCode>,
+    /// The replacement's new order ID, or the venue's cancel of the original.
+    #[serde(default)]
+    pub venue_order: Option<TeePerpModifyVenueOrder>,
 }
 tee_perp_outcome_helpers!(TeePerpModifyResponse);
+
+impl TeePerpModifyResponse {
+    /// Whether Hyperliquid cancelled the original order during a rejected
+    /// modify, so nothing rests under the cloid any more.
+    pub fn venue_cancelled_original(&self) -> bool {
+        matches!(
+            self.venue_order,
+            Some(TeePerpModifyVenueOrder::Cancelled { .. })
+        )
+    }
+}
 
 /// One child of a [`TeePerpBatchModifyResponse`], in request order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -713,10 +762,16 @@ pub struct TeePerpBatchModifyChildResponse {
     /// The child's preserved cloid as 0x-prefixed 16-byte hex.
     pub cloid: String,
     /// This child's own outcome. `accepted`: the venue applied this modify.
-    /// `rejected`: the venue refused it, so the earlier order still rests.
-    /// `not_submitted`: nothing reached the venue. `unknown`: reconciled from
-    /// venue state.
+    /// `rejected`: the venue refused it; the earlier order still rests unless
+    /// [`Self::venue_order`] is `Cancelled`. `not_submitted`: nothing reached
+    /// the venue. `unknown`: reconciled from venue state.
     pub stage: TeePerpOrderStage,
+    /// The venue's error for a rejected child, verbatim.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// The replacement's new order ID, or the venue's cancel of the original.
+    #[serde(default)]
+    pub venue_order: Option<TeePerpModifyVenueOrder>,
 }
 
 impl TeePerpBatchModifyChildResponse {
@@ -724,14 +779,25 @@ impl TeePerpBatchModifyChildResponse {
     pub fn is_accepted(&self) -> bool {
         self.stage == TeePerpOrderStage::Accepted
     }
+
+    /// Whether Hyperliquid cancelled this child's original order before its
+    /// replacement failed, so nothing rests under the cloid any more.
+    pub fn venue_cancelled_original(&self) -> bool {
+        matches!(
+            self.venue_order,
+            Some(TeePerpModifyVenueOrder::Cancelled { .. })
+        )
+    }
 }
 
 /// Response of [`TEE_PERP_ORDER_BATCH_MODIFY_ROUTE`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TeePerpBatchModifyResponse {
-    /// Whole-action stage: `accepted` only when every child was, `rejected`
-    /// only when every child was. Read [`Self::children`] for a mixed result.
+    /// Whole-action stage: `accepted` when every child was, `rejected` when
+    /// every child was, `partial` when the venue answered every child with a
+    /// mix, and `unknown` only when some child is genuinely unknown. Read
+    /// [`Self::children`] for each child.
     pub stage: TeePerpOrderStage,
     #[serde(default)]
     pub error_code: Option<TeePerpErrorCode>,

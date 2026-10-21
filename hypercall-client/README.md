@@ -365,8 +365,23 @@ a TEE-held Hyperliquid API wallet, after Portfolio Margin admission. They are
 separate from the managed `/v1/actions/*` directive methods above and use the
 same app key (an active Account.sol API wallet) to sign.
 
+An options agent key is not a perps app key. A key approved with
+`ApproveAgent` (for example one made with "Create agent key" in account
+settings) signs options and REST requests only. Perp trading directives and
+TEE perp routes accept only a signer that is an active on-chain API wallet of
+the Account (`Account.isApiWalletActive`). The manager signs setup actions such
+as `update_api_wallet` but cannot sign trades itself, and cannot be an API
+wallet. So the manager must register the key with `update_api_wallet`. Until then every TEE perp
+request it signs is rejected with `invalid_signature`, and the message says the
+key is an options/REST key that is not enabled for perps. The settings page can
+do this step too: tick "Also enable for perps" when creating a key, or press
+"Enable for perps" on an existing one.
+
 Setup, once per account, with the manager wallet:
 
+0. `update_api_wallet` registers the app key as an Account.sol API wallet
+   (`hc_update_api_wallet`, domain `HypercallManagerSign`). Skip it when the
+   app key is already active (`Account.isApiWalletActive`).
 1. `enroll_tee_api_wallet` requests the account's TEE API wallet, signs the
    `HLAddApiWallet` approval (domain `HypercallManagerSign`), submits it, and
    waits until Hyperliquid binds the wallet. `HyperliquidInfoClient::is_tee_api_wallet_active`
@@ -412,12 +427,15 @@ code the preview returns.
 
 ```rust,no_run
 use hypercall_client::{
-    AccountAddress, ApproveHypercallBuilderParams, HypercallClient, HypercallWallet,
+    AccountAddress, ApproveHypercallBuilderParams, DirectiveDeliveryStatus, HypercallClient,
+    HypercallWallet,
     HyperliquidInfoClient, PerpCancelByCloidParams, PerpLimitOrderParams, PerpPreviewAction,
     PerpPreviewRequest, PerpTimeInForce, Side, TeeApiWalletEnrollmentPolling, TeePerpBracketEntry,
     TeePerpBracketOrderParams, TeePerpExit, TeePerpLeverageParams, TeePerpMarketOrderParams,
-    TeePerpTpsl, TeePerpTriggerExecution, TeePerpTriggerOrderParams, PERP_MARKET_SLIPPAGE_BPS,
+    TeePerpTpsl, TeePerpTriggerExecution, TeePerpTriggerOrderParams, UpdateApiWalletParams,
+    PERP_MARKET_SLIPPAGE_BPS,
 };
+use alloy::primitives::keccak256;
 use rust_decimal::Decimal;
 
 #[tokio::main]
@@ -428,7 +446,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let account: AccountAddress = "0xYOUR_ACCOUNT_SOL_ADDRESS".parse()?;
     let hyperliquid = HyperliquidInfoClient::mainnet();
 
-    // One-time setup with the manager wallet.
+    // One-time setup with the manager wallet. An options agent key is not
+    // enough: register the app key as an on-chain API wallet first.
+    let registration = client
+        .update_api_wallet(
+            &manager,
+            UpdateApiWalletParams {
+                account,
+                name: keccak256("tee-perps-app-key"),
+                api_wallet: app_key.address,
+                nonce: None,
+            },
+        )
+        .await?;
+    // Submission only enqueues the directive. Wait until it is final on
+    // chain before the app key signs anything.
+    loop {
+        let status = client
+            .get_directive_status(&registration.directive_id)
+            .await?;
+        match status.delivery_status {
+            DirectiveDeliveryStatus::Finalized => break,
+            DirectiveDeliveryStatus::CoreRejected
+            | DirectiveDeliveryStatus::Reverted
+            | DirectiveDeliveryStatus::Expired
+            | DirectiveDeliveryStatus::DeadLettered => {
+                return Err(format!("API wallet registration failed: {status:?}").into())
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+        }
+    }
     let enrollment = client
         .enroll_tee_api_wallet(
             &manager,
@@ -603,17 +650,41 @@ part of the TEE perp SDK surface.
 TIF and reduce-only flag. `batch_modify_tee_perp_orders` replaces several under
 one signature and one venue nonce (Hyperliquid `batchModify`). The engine
 admits every child or none, then each child settles on its own, so read
-`children` (each with its `index`, `requestId`, `targetDirectiveId`, `cloid` and
-`stage`) rather than only the whole-action stage, which is `accepted` or
-`rejected` only when every child agrees. `children_to_reconcile()` lists the
-children whose outcome is not definitive; a child stage this SDK does not know
-parses as `Unrecognized` and is treated as unknown. A `rejected` or
-`not_submitted` child leaves the original order resting.
+`children` (each with its `index`, `requestId`, `targetDirectiveId`, `cloid`,
+`stage`, `message` and `venueOrder`). Whenever Hyperliquid answered every child,
+the whole-action stage is definite: `accepted` or `rejected` when every child
+agrees, `partial` for a mix. It is `unknown` only when some child is genuinely
+unknown (timeout, transport failure, unverifiable venue response).
+`children_to_reconcile()` lists the children whose outcome is not definitive; a
+stage this SDK does not know parses as `Unrecognized` and is treated as
+unknown.
+
+Hyperliquid applies a modify as a cancel of the original order followed by the
+placement of the replacement. When the placement fails after the cancel (the
+venue's `Error placing new order during modify: ...`, for example an ALO
+replacement that would cross), the original order is gone too. The response
+then reports `stage: "rejected"` with `venueOrder: {"status": "cancelled",
+"reason": "modify rejected; venue cancelled original"}`
+(`venue_cancelled_original()`), and the engine treats the order as cancelled:
+its reservation is released once a newer position snapshot has absorbed any
+fill before the cancel. Any other `rejected` or `not_submitted` outcome leaves
+the original order resting.
+
+Modify and batch modify return only after Hyperliquid answered. An accepted
+modify's `venueOrder` carries the replacement's NEW `oid` (`resting` or
+`filled`); the old `oid` is cancelled. Trust the response over an immediate
+`orderStatus` read: Hyperliquid's info endpoint can show the pre-modify order
+for a few seconds after the exchange applied the modify.
 
 The client refuses a batch before signing when it is empty, repeats a target or
 cloid, or exceeds `max_children` (default 50, the server's default
-`api.tee_perp_batch_modify_max_children`; never above 100). A batch is charged
-one order placement per child against the rate limit.
+`api.tee_perp_batch_modify_max_children`; never above 100).
+
+TEE perp orders, modifies and batch modifies carry no Hypercall rate limit;
+Hyperliquid's address-based request limit governs them. After Hyperliquid
+refuses an Account's order action for that limit, the API answers that
+Account's further order actions with `429 venue_rate_limited` and
+`Retry-After` for 10 seconds without sending them. Cancels are never held back.
 
 TWAP (`place_tee_perp_twap_order`, `cancel_tee_perp_twap`) runs 5 to 1440
 minutes, and the engine reserves the full size until fills arrive. TWAP and
@@ -698,6 +769,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for child in &batch.children {
         match child.stage {
             TeePerpOrderStage::Accepted => println!("{} moved", child.cloid),
+            // Hyperliquid cancelled the original before the replacement failed.
+            _ if child.venue_cancelled_original() => {
+                println!("{} cancelled: nothing rests any more", child.cloid)
+            }
             TeePerpOrderStage::Rejected | TeePerpOrderStage::NotSubmitted => {
                 println!("{} unchanged: the old order still rests", child.cloid)
             }

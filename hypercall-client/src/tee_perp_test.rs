@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_support::{json_body, read_http_request, serve_once, serve_sequence};
 use alloy::primitives::Signature;
-use hypercall_sdk_types::TeePerpOrderStage;
+use hypercall_sdk_types::{PerpPreviewAction, TeePerpOrderStage};
 use rust_decimal_macros::dec;
 use std::str::FromStr;
 use tokio::io::AsyncWriteExt;

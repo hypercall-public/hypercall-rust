@@ -1,0 +1,5 @@
+# Clippy configuration for the public SDK workspace. Clippy reads only the
+# nearest clippy.toml, so this file also governs these crates in the source
+# repository. Keep the threshold in step with the workspace `too_many_lines`
+# lint in Cargo.toml.
+too-many-lines-threshold = 150

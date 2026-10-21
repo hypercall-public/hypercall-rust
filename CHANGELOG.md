@@ -16,10 +16,12 @@ removed from NSS on October 20 and `webpki-roots` 1.0.10 drops
   `emSign ECC Root CA - G3` and will not be updated. The HTTP client now uses
   reqwest 0.12, whose `rustls-tls` trusts `webpki-roots` 1.x.
 - `hypercall-client` (with `alloy-rustls`) and `hypercall-hyperliquid` depend
-  on `webpki-roots` 1.0.10 directly. Cargo resolves one `webpki-roots` 1.x for
-  the whole build, so no build that uses these crates can resolve a root set
-  that still trusts the compromised root. This covers reqwest's `rustls-tls`
-  and hypersdk's WebSocket.
+  on `webpki-roots` 1.0.10 directly, and `hypercall-client` requires reqwest
+  0.12.16 or later, the first 0.12 release on `webpki-roots` 1.x. Cargo resolves one
+  `webpki-roots` 1.x for the whole build, so the SDK's rustls HTTP client
+  (reqwest `rustls-tls`) and hypersdk's WebSocket cannot trust the compromised
+  root. Other dependencies in your build may still pull `webpki-roots` 0.25 or
+  earlier, which keeps the root; this release does not change those.
 - The other emSign roots (`emSign Root CA - C1`, `emSign Root CA - G1`,
   `emSign ECC Root CA - C3`) remain in Mozilla's store and in `webpki-roots`.
   They are not implicated in the compromise.
@@ -36,15 +38,41 @@ removed from NSS on October 20 and `webpki-roots` 1.0.10 drops
 ### Breaking
 
 - reqwest types in the public API move from 0.11 to 0.12:
-  `ClientError::Http(reqwest::Error)` and `HypercallClient::raw_post`, which
-  returns `reqwest::Response`. Code that names these types must depend on
-  reqwest 0.12.
+  [`ClientError::Http(reqwest::Error)`](https://docs.rs/hypercall-client/0.4.0/hypercall_client/error/enum.ClientError.html#variant.Http)
+  and
+  [`HypercallClient::raw_post`](https://docs.rs/hypercall-client/0.4.0/hypercall_client/api/struct.HypercallClient.html#method.raw_post),
+  which returns `reqwest::Response`. Code that names these types must depend
+  on reqwest 0.12.
 - With the `gzip` feature, reqwest 0.12 reports a response body cut off
   mid-read as a decode error whose source is the body error. Callers that
-  checked `reqwest::Error::is_body` on the outer error should walk the source
-  chain.
+  checked
+  [`reqwest::Error::is_body`](https://docs.rs/reqwest/0.12.16/reqwest/struct.Error.html#method.is_body)
+  on the outer error should walk the source chain.
+- `RfqInputError` gains `NetPremiumSubMicroPrecision`. RFQ quote building now
+  rejects a `net_premium` with more than six decimal places instead of
+  truncating it in the EIP-712 message, so the signed value always matches the
+  premium sent on the wire. Exhaustive matches on `RfqInputError` need a new
+  arm.
+- `TeePerpModifyResponse` gains `venue_order`, and
+  `TeePerpOrderBatchChildResponse` gains `message` and `venue_order`
+  (`TeePerpModifyVenueOrder`). Code that builds these structs with literals
+  must set the new fields.
 
-## 0.3.0 (unreleased)
+### Changed
+
+- TEE perp modify and batch modify return only after Hyperliquid answers. An
+  accepted modify's `venue_order` carries the replacement's new `oid`.
+- `TeePerpOrderStage::Partial` reports a batch modify whose children
+  disagree. The whole-action stage is `unknown` only when some child is
+  genuinely unknown. `venue_cancelled_original()` reports a modify whose
+  replacement failed after Hyperliquid cancelled the original order.
+- TEE perp order actions carry no Hypercall rate limit; Hyperliquid's
+  address-based limit governs them (see the `hypercall-client` README).
+- The `hypercall-client` README documents registering a perps app key as an
+  on-chain API wallet with `update_api_wallet` before it signs TEE perp
+  requests. An options agent key alone is rejected.
+
+## 0.3.0
 
 All five public crates move to `0.3.0` together: `hypercall-ws-protocol`,
 `hypercall-sdk-types`, `hypercall-client`, `hypercall-hyperliquid`, and
