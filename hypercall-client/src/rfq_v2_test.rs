@@ -1416,13 +1416,18 @@ async fn a_refusal_with_an_unreadable_body_stays_definite() {
     else {
         panic!("{error:?}");
     };
-    // The concrete transport error survives for callers to inspect.
-    assert!(
-        source
+    // The concrete transport error survives for callers to inspect. With the
+    // `gzip` feature, reqwest 0.12 reports the cut-off body as a decode error
+    // whose source is the body error.
+    let mut transport: Option<&(dyn std::error::Error + 'static)> = Some(source.as_ref());
+    let mut saw_body_error = false;
+    while let Some(error) = transport {
+        saw_body_error |= error
             .downcast_ref::<reqwest::Error>()
-            .is_some_and(reqwest::Error::is_body),
-        "{source:?}"
-    );
+            .is_some_and(reqwest::Error::is_body);
+        transport = error.source();
+    }
+    assert!(saw_body_error, "{source:?}");
     assert!(!crate::rfq_v2::ambiguous_rfq_v2_submission(&error));
     assert!(crate::rfq_v2::ambiguous_rfq_v2_submission(
         &crate::ClientError::api_source(503, std::io::Error::other("cut off"))

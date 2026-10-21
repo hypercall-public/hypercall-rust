@@ -18,7 +18,7 @@ available:
 
 ```toml
 [dependencies]
-hypercall-client = { git = "https://github.com/hypercall-public/hypercall-rust", tag = "v0.3.0" }
+hypercall-client = { git = "https://github.com/hypercall-public/hypercall-rust", tag = "v0.4.0" }
 ```
 
 Then create a production API client:

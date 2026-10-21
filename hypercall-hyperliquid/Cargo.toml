@@ -1,6 +1,6 @@
 [package]
 name = "hypercall-hyperliquid"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Direct Hyperliquid perp venue adapter for Hypercall SDK clients"
 readme = "README.md"
@@ -16,7 +16,8 @@ workspace = true
 
 [package.metadata.cargo-machete]
 # Intentional transitive compatibility constraint for the optional AWS signer.
-ignored = ["aws-smithy-types"]
+# webpki-roots is a version floor for the roots hypersdk's WebSocket trusts.
+ignored = ["aws-smithy-types", "webpki-roots"]
 
 [dependencies]
 alloy = { version = "1.5.2", default-features = false, features = ["eip712", "signer-local", "signers"] }
@@ -25,7 +26,7 @@ alloy = { version = "1.5.2", default-features = false, features = ["eip712", "si
 # https://github.com/awslabs/aws-sdk-rust/issues/1459
 aws-smithy-types = { version = ">=1.5.0, <1.7.0", optional = true }
 anyhow = "1"
-hypercall-client = { path = "../hypercall-client", version = "0.3.0", default-features = false, features = ["alloy-rustls"], optional = true }
+hypercall-client = { path = "../hypercall-client", version = "0.4.0", default-features = false, features = ["alloy-rustls"], optional = true }
 hypersdk = "=0.2.13"
 rmp-serde = "1.3"
 rust_decimal = "1.39"
@@ -34,6 +35,11 @@ serde_json = "1"
 thiserror = "2"
 displaystr = "0.1.16"
 url = { version = "2", optional = true }
+# hypersdk's WebSocket (yawc over rustls) trusts the bundled webpki-roots 1.x
+# set. 1.0.10 removes `emSign ECC Root CA - G3` after the October 2026
+# eMudhra CA key compromise, and Cargo unifies every webpki-roots 1.x user to
+# this floor.
+webpki-roots = "1.0.10"
 
 [features]
 default = ["venue"]
