@@ -1,6 +1,6 @@
 [package]
 name = "hypercall-ws-protocol"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Stable WebSocket protocol DTOs for Hypercall edge services"
 readme = "README.md"

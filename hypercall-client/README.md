@@ -882,8 +882,8 @@ cargo build -p hypercall-client --examples
 | feature | used by | why |
 | --- | --- | --- |
 | default | client users | Enables the Alloy rustls backend and `rfq-v2`. |
-| alloy-rustls | live integrations | Enables Alloy's reqwest rustls backend. |
-| alloy-native-tls | native TLS users | Enables Alloy's reqwest native TLS backend. |
+| alloy-rustls | live integrations | Enables rustls for the HTTP client, trusting the bundled webpki-roots set (1.0.10 or later), and Alloy's reqwest rustls backend. |
+| alloy-native-tls | native TLS users | Enables native TLS (the platform trust store) for the HTTP client and Alloy's reqwest native TLS backend. |
 | kms | AWS/client KMS users | Enables Alloy AWS signer support. |
 | rfq-v2 (default) | RFQ V2 takers and makers | RFQ V2 client: `rfq_v2`, `rfq_v2_recovery`, `rfq_v2_signing`, signed read grants, and the private `rfq_v2` WebSocket channel. |
 
@@ -904,7 +904,7 @@ The `rfq-v2` feature is on by default since 0.3.0. It also enables `rfq-v2` on
 
 ```toml
 [dependencies]
-hypercall-client = { git = "https://github.com/hypercall-public/hypercall-rust", tag = "v0.3.0", default-features = false, features = ["alloy-rustls", "rfq-v2"] }
+hypercall-client = { git = "https://github.com/hypercall-public/hypercall-rust", tag = "v0.4.0", default-features = false, features = ["alloy-rustls", "rfq-v2"] }
 ```
 
 | Module | What it does |

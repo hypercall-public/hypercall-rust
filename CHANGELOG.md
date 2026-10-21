@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.4.0 (unreleased)
+
+All five public crates move to `0.4.0` together. This is a security release.
+
+### Security: distrust the compromised eMudhra root
+
+eMudhra reported eight compromised intermediate CA keys on October 17, 2026.
+The six TLS intermediates chain to `emSign ECC Root CA - G3`, which Mozilla
+removed from NSS on October 20 and `webpki-roots` 1.0.10 drops
+([advisory](https://thehackernews.com/2026/10/eight-emudhra-ca-keys-compromised.html)).
+
+- `hypercall-client`'s default `alloy-rustls` feature ran the HTTP client on
+  reqwest 0.11, which pins `webpki-roots` 0.25.4. That release still trusts
+  `emSign ECC Root CA - G3` and will not be updated. The HTTP client now uses
+  reqwest 0.12, whose `rustls-tls` trusts `webpki-roots` 1.x.
+- `hypercall-client` (with `alloy-rustls`) and `hypercall-hyperliquid` depend
+  on `webpki-roots` 1.0.10 directly. Cargo resolves one `webpki-roots` 1.x for
+  the whole build, so no build that uses these crates can resolve a root set
+  that still trusts the compromised root. This covers reqwest's `rustls-tls`
+  and hypersdk's WebSocket.
+- The other emSign roots (`emSign Root CA - C1`, `emSign Root CA - G1`,
+  `emSign ECC Root CA - C3`) remain in Mozilla's store and in `webpki-roots`.
+  They are not implicated in the compromise.
+- `alloy-native-tls`, the `WsClient` WebSocket (native-tls), and Alloy 1.8's
+  reqwest 0.13 rustls backend (rustls-platform-verifier) use the operating
+  system's trust store. Keep the OS current; Apple and Microsoft blocked the
+  eight intermediates on October 19 and 20.
+- Removing the root does not reject every chain through the compromised
+  keys. The advisory reports Sectigo cross-signed copies of the intermediates,
+  which chain to Sectigo roots. rustls with a bundled root set does no
+  revocation checking (browsers block these through CRLSet and OneCRL), so
+  a chain through a cross-signed copy is not rejected by this release.
+
+### Breaking
+
+- reqwest types in the public API move from 0.11 to 0.12:
+  `ClientError::Http(reqwest::Error)` and `HypercallClient::raw_post`, which
+  returns `reqwest::Response`. Code that names these types must depend on
+  reqwest 0.12.
+- With the `gzip` feature, reqwest 0.12 reports a response body cut off
+  mid-read as a decode error whose source is the body error. Callers that
+  checked `reqwest::Error::is_body` on the outer error should walk the source
+  chain.
+
 ## 0.3.0 (unreleased)
 
 All five public crates move to `0.3.0` together: `hypercall-ws-protocol`,

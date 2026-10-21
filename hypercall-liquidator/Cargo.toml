@@ -1,6 +1,6 @@
 [package]
 name = "hypercall-liquidator"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Public proof-of-concept standard margin liquidator with external Hyperliquid hedge planning"
 readme = "README.md"
@@ -26,9 +26,9 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 hex = "0.4"
-hypercall-client = { path = "../hypercall-client", version = "0.3.0", default-features = false }
-hypercall-hyperliquid = { path = "../hypercall-hyperliquid", version = "0.3.0" }
-hypercall-sdk-types = { path = "../hypercall-sdk-types", version = "0.3.0" }
+hypercall-client = { path = "../hypercall-client", version = "0.4.0", default-features = false }
+hypercall-hyperliquid = { path = "../hypercall-hyperliquid", version = "0.4.0" }
+hypercall-sdk-types = { path = "../hypercall-sdk-types", version = "0.4.0" }
 leptos = { version = "0.7", optional = true }
 rust_decimal = { version = "1", features = ["serde-with-str"] }
 serde = { version = "1", features = ["derive"] }
