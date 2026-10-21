@@ -1609,6 +1609,7 @@ where
     }
 }
 
+#[expect(clippy::too_many_lines, reason = "pre-existing; split pending")]
 async fn run_ws_session(
     shared: Arc<WsClientShared>,
     config: WsClientConfig,

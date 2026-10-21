@@ -67,6 +67,9 @@ pub enum RfqInputError {
     NetPremiumNotRepresentable {
         net_premium: rust_decimal::Decimal,
     } = "net_premium {net_premium} not representable as micro-units i64",
+    NetPremiumSubMicroPrecision {
+        net_premium: rust_decimal::Decimal,
+    } = "net_premium {net_premium} has sub-micro precision; use at most 6 decimal places so the signed value matches the wire string",
     NetPremiumConversion {
         #[source]
         source: BoxClientSource,

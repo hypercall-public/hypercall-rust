@@ -36,6 +36,13 @@ use crate::error::{ClientError, Result, RfqInputError};
 use crate::wallet::HypercallWallet;
 use hypercall_ws_protocol::{QpClientMessage, QpResponseLeg, QpRfqLeg};
 
+/// EIP-712 encodes `net_premium` as an integer number of micro-units (6
+/// decimal places). The signing conversion truncates any finer precision
+/// toward zero, so the signed value must bind exactly the premium emitted on
+/// the wire — sub-micro digits would let the signature diverge from what the
+/// server stores and charges.
+const NET_PREMIUM_MICRO_DECIMAL_PLACES: u32 = 6;
+
 /// Build a signed RFQ quote response from an inbound RFQ request.
 ///
 /// Only per-leg prices come from the quote provider. Instrument, side, and
@@ -111,6 +118,16 @@ pub async fn build_rfq_quote(
     }
 
     let legs_hash = compute_qp_legs_hash(legs)?;
+
+    // Reject sub-micro net_premium before the `* 1e6 -> to_i64()` conversion
+    // truncates it toward zero. Without this guard the signed integer would
+    // alias distinct premiums while `net_premium.to_string()` on the wire
+    // carries the full-precision value the server stores and charges.
+    if net_premium.normalize().scale() > NET_PREMIUM_MICRO_DECIMAL_PLACES {
+        return Err(ClientError::RfqInput(
+            RfqInputError::NetPremiumSubMicroPrecision { net_premium },
+        ));
+    }
 
     let premium_scaled = net_premium * Decimal::new(1_000_000, 0);
     let premium_micro = premium_scaled.to_i64().ok_or(ClientError::RfqInput(
@@ -494,6 +511,52 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(signature, expected_signature);
+        } else {
+            panic!("expected RfqResponse");
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_sub_micro_net_premium() {
+        let wallet = HypercallWallet::from_private_key(TEST_KEY, 998).unwrap();
+        let legs = make_legs(&[("BTC-20260501-90000-C", "sell", "1")]);
+        // sell leg: net_premium = price * size = 1.0000009 (7 decimal places).
+        let err = build_rfq_quote(
+            "019060da-0000-7000-8000-000000000010",
+            &legs,
+            &[dec!(1.0000009)],
+            3000,
+            &wallet,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            &err,
+            ClientError::RfqInput(RfqInputError::NetPremiumSubMicroPrecision { net_premium })
+                if *net_premium == dec!(1.0000009)
+        ));
+        assert!(
+            err.to_string().contains("sub-micro precision"),
+            "expected sub-micro precision message, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admits_exactly_six_decimal_places_net_premium() {
+        let wallet = HypercallWallet::from_private_key(TEST_KEY, 998).unwrap();
+        let legs = make_legs(&[("BTC-20260501-90000-C", "sell", "1")]);
+        let msg = build_rfq_quote(
+            "019060da-0000-7000-8000-000000000011",
+            &legs,
+            &[dec!(1.123456)],
+            3000,
+            &wallet,
+        )
+        .await
+        .unwrap();
+        if let QpClientMessage::RfqResponse { net_premium, .. } = msg {
+            let premium: Decimal = net_premium.unwrap().parse().unwrap();
+            assert_eq!(premium, dec!(1.123456));
         } else {
             panic!("expected RfqResponse");
         }

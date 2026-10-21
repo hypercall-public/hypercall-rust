@@ -887,6 +887,7 @@ impl PreparedHyperliquidAction {
 
     /// Validate a previously accepted action on re-read. Version 1 is never
     /// admitted by `validate` or `from_canonical_bytes` for fresh submission.
+    #[expect(clippy::too_many_lines, reason = "pre-existing; split pending")]
     pub fn validate_journaled(&self) -> Result<()> {
         if !matches!(
             self.version,

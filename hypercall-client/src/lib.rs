@@ -119,9 +119,9 @@ pub use hypercall_sdk_types::{
     PerpPreviewOrderType, PerpPreviewRequest, PerpPreviewResponse, PerpPreviewTif,
     PerpPreviewTrigger, PerpRejectionReasonCode, TeeApiWalletApprovalPackage,
     TeePerpCancelResponse, TeePerpErrorCode, TeePerpLeverageAction, TeePerpLeverageResponse,
-    TeePerpMarketEntry, TeePerpMarketsResponse, TeePerpOrderBatchAction, TeePerpOrderBatchResponse,
-    TeePerpOrderGrouping, TeePerpOrderResponse, TeePerpOrderStage, TeePerpOrderType,
-    TeePerpOrderWire, TeePerpTpsl, TeePerpVenueActionResponse,
+    TeePerpMarketEntry, TeePerpMarketsResponse, TeePerpModifyVenueOrder, TeePerpOrderBatchAction,
+    TeePerpOrderBatchResponse, TeePerpOrderGrouping, TeePerpOrderResponse, TeePerpOrderStage,
+    TeePerpOrderType, TeePerpOrderWire, TeePerpTpsl, TeePerpVenueActionResponse,
 };
 pub use hypercall_sdk_types::{
     TeePerpBatchModifyAction, TeePerpBatchModifyChildResponse, TeePerpBatchModifyResponse,

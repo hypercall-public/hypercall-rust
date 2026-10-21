@@ -554,6 +554,7 @@ fn firm_view(
 }
 
 #[tokio::test]
+#[expect(clippy::too_many_lines, reason = "pre-existing; split pending")]
 async fn client_covers_the_complete_proposed_route_inventory() {
     let rfq_id = id("f7c1ee82-c235-4bef-bc4b-af719f73d3ce");
     let indicative_id = id("169a869d-9fa7-490b-b68e-d78005740d4c");

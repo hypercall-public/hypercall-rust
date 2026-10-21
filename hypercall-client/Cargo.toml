@@ -53,7 +53,8 @@ base64 = { version = "0.22", optional = true }
 # gzip: send Accept-Encoding: gzip and decode transparently. The public API
 # gzips responses at its edge (large reads such as /markets shrink ~7x).
 # charset and http2 keep reqwest 0.11 behavior: 0.12 makes both optional.
-reqwest = { version = "0.12", default-features = false, features = ["charset", "gzip", "http2", "json"] }
+# 0.12.16 is the first 0.12 release whose `rustls-tls` uses webpki-roots 1.x.
+reqwest = { version = "0.12.16", default-features = false, features = ["charset", "gzip", "http2", "json"] }
 # Floor for the root set reqwest's `rustls-tls` trusts. 1.0.10 removes
 # `emSign ECC Root CA - G3` after the October 2026 eMudhra CA key compromise.
 # Cargo unifies every webpki-roots 1.x user in the build to this one version.

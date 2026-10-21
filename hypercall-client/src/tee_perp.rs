@@ -4,6 +4,14 @@
 //!
 //! # Flow
 //!
+//! 0. **Register the app key once** (manager wallet):
+//!    [`HypercallClient::update_api_wallet`] adds it as an `Account.sol` API
+//!    wallet. An options agent key (`ApproveAgent`, including keys made with
+//!    "Create agent key" in account settings) is not enough on its own: TEE
+//!    perp trades must be signed by an active on-chain API wallet, and
+//!    anything else (including the manager itself) is rejected with
+//!    `invalid_signature`. Wait for the registration directive to finalize
+//!    before the app key signs.
 //! 1. **Enroll the TEE API wallet once** (manager wallet):
 //!    [`HypercallClient::enroll_tee_api_wallet`] requests the account's TEE
 //!    wallet, signs the `HLAddApiWallet` approval in the `HypercallManagerSign`
@@ -42,12 +50,15 @@
 //!
 //! ```rust,no_run
 //! use hypercall_client::{
-//!     AccountAddress, ApproveHypercallBuilderParams, HypercallClient, HypercallWallet,
+//!     AccountAddress, ApproveHypercallBuilderParams, DirectiveDeliveryStatus, HypercallClient,
+//!     HypercallWallet,
 //!     HyperliquidInfoClient, PerpCancelByCloidParams, PerpLimitOrderParams, PerpPreviewAction,
 //!     PerpPreviewRequest, PerpTimeInForce, Side, TeeApiWalletEnrollmentPolling, TeePerpBracketEntry,
 //!     TeePerpBracketOrderParams, TeePerpExit, TeePerpLeverageParams, TeePerpMarketOrderParams,
-//!     TeePerpTpsl, TeePerpTriggerExecution, TeePerpTriggerOrderParams, PERP_MARKET_SLIPPAGE_BPS,
+//!     TeePerpTpsl, TeePerpTriggerExecution, TeePerpTriggerOrderParams, UpdateApiWalletParams,
+//!     PERP_MARKET_SLIPPAGE_BPS,
 //! };
+//! use alloy::primitives::keccak256;
 //! use rust_decimal::Decimal;
 //!
 //! #[tokio::main]
@@ -58,7 +69,36 @@
 //!     let account: AccountAddress = "0xYOUR_ACCOUNT_SOL_ADDRESS".parse()?;
 //!     let hyperliquid = HyperliquidInfoClient::mainnet();
 //!
-//!     // One-time setup with the manager wallet.
+//!     // One-time setup with the manager wallet. An options agent key is not
+//!     // enough: register the app key as an on-chain API wallet first.
+//!     let registration = client
+//!         .update_api_wallet(
+//!             &manager,
+//!             UpdateApiWalletParams {
+//!                 account,
+//!                 name: keccak256("tee-perps-app-key"),
+//!                 api_wallet: app_key.address,
+//!                 nonce: None,
+//!             },
+//!         )
+//!         .await?;
+//!     // Submission only enqueues the directive. Wait until it is final on
+//!     // chain before the app key signs anything.
+//!     loop {
+//!         let status = client
+//!             .get_directive_status(&registration.directive_id)
+//!             .await?;
+//!         match status.delivery_status {
+//!             DirectiveDeliveryStatus::Finalized => break,
+//!             DirectiveDeliveryStatus::CoreRejected
+//!             | DirectiveDeliveryStatus::Reverted
+//!             | DirectiveDeliveryStatus::Expired
+//!             | DirectiveDeliveryStatus::DeadLettered => {
+//!                 return Err(format!("API wallet registration failed: {status:?}").into())
+//!             }
+//!             _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+//!         }
+//!     }
 //!     let enrollment = client
 //!         .enroll_tee_api_wallet(
 //!             &manager,
@@ -307,6 +347,10 @@
 //!     for child in &batch.children {
 //!         match child.stage {
 //!             TeePerpOrderStage::Accepted => println!("{} moved", child.cloid),
+//!             // Hyperliquid cancelled the original before the replacement failed.
+//!             _ if child.venue_cancelled_original() => {
+//!                 println!("{} cancelled: nothing rests any more", child.cloid)
+//!             }
 //!             TeePerpOrderStage::Rejected | TeePerpOrderStage::NotSubmitted => {
 //!                 println!("{} unchanged: the old order still rests", child.cloid)
 //!             }
@@ -378,8 +422,7 @@ use hypercall_sdk_types::tee_perp::{
 use hypercall_sdk_types::{
     ApiResponse, DirectiveDeliveryStatus, DirectiveDomainStatus, DirectiveStatusResponse,
     DirectiveSubmitRequest, DirectiveSubmitResponse, ExchangeInfoResponse, HlCancelByCloidAction,
-    HlCancelByOidAction, HlLimitOrderAction, PerpPreviewAction, PerpPreviewLimit, PerpPreviewOrder,
-    PerpPreviewOrderType, PerpPreviewRequest, PerpPreviewResponse, PerpPreviewTrigger,
+    HlCancelByOidAction, HlLimitOrderAction, PerpPreviewRequest, PerpPreviewResponse,
     PerpTimeInForce, Side, TeeApiWalletApprovalPackage, TeeApiWalletApprovalRequest,
     TeeApiWalletApprovalSubmitRequest, TeePerpCancelResponse, TeePerpLeverageAction,
     TeePerpLeverageResponse, TeePerpLimitOrderType, TeePerpMarketsResponse,
@@ -1838,42 +1881,9 @@ fn tee_submission_is_ambiguous(error: &ClientError) -> bool {
     )
 }
 
-fn from_perp_units(units: u64) -> Decimal {
-    Decimal::from_i128_with_scale(i128::from(units), 8).normalize()
-}
-
-/// The preview form of a signed order wire (1e8 integers back to decimals),
-/// so a preview describes exactly what will be signed.
-pub fn perp_preview_order(order: &TeePerpOrderWire) -> PerpPreviewOrder {
-    PerpPreviewOrder {
-        asset: order.asset,
-        is_buy: order.is_buy,
-        limit_px: from_perp_units(order.limit_px),
-        sz: from_perp_units(order.sz),
-        reduce_only: order.reduce_only,
-        order_type: match order.order_type {
-            TeePerpOrderType::Limit(limit) => PerpPreviewOrderType::Limit(PerpPreviewLimit {
-                tif: limit.tif.into(),
-            }),
-            TeePerpOrderType::Trigger(trigger) => {
-                PerpPreviewOrderType::Trigger(PerpPreviewTrigger {
-                    trigger_px: from_perp_units(trigger.trigger_px),
-                    is_market: trigger.is_market,
-                    tpsl: trigger.tpsl,
-                })
-            }
-        },
-    }
-}
-
-/// The preview action of a signed order batch.
-pub fn perp_preview_batch_action(batch: &TeePerpOrderBatchAction) -> PerpPreviewAction {
-    PerpPreviewAction::OrderBatch {
-        grouping: batch.grouping,
-        orders: batch.orders.iter().map(perp_preview_order).collect(),
-        leverage: None,
-    }
-}
+#[path = "tee_perp_preview.rs"]
+mod preview;
+pub use preview::{perp_preview_batch_action, perp_preview_order};
 
 // ---------------------------------------------------------------------------
 // Request parameters

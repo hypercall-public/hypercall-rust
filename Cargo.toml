@@ -16,3 +16,4 @@ unexpected_cfgs = { level = "deny", check-cfg = ['cfg(kani)'] }
 all = { level = "deny", priority = -1 }
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
+too_many_lines = "deny"
