@@ -39,12 +39,13 @@ use uuid::Uuid;
 
 use hypercall_sdk_types::{
     CreateRfqV2Request, CreateRfqV2Response, DeclineRfqV2Request, ListRfqV2ChangesQuery,
-    ListRfqV2ChangesResponse, ListRfqV2Query, ListRfqV2QuotesQuery, ListRfqV2QuotesResponse,
-    ListRfqV2Response, PublishRfqV2FirmQuoteRequest, PublishRfqV2IndicativeQuoteRequest,
-    PublishRfqV2QuoteResponse, RequestRfqV2FirmQuoteRequest, RfqV2AuthorizedTerms,
-    RfqV2AutoExecutionLimit, RfqV2BulkWithdrawalRequest, RfqV2Digest, RfqV2ErrorResponse,
-    RfqV2ExecutionRequest, RfqV2ExecutionResponse, RfqV2FillPolicy, RfqV2InvalidationRequest,
-    RfqV2OperationResponse, RfqV2PackageLeg, RfqV2PreflightStatus, RfqV2QuoteReplacement,
+    ListRfqV2ChangesResponse, ListRfqV2ExecutionsQuery, ListRfqV2ExecutionsResponse,
+    ListRfqV2Query, ListRfqV2QuotesQuery, ListRfqV2QuotesResponse, ListRfqV2Response,
+    PublishRfqV2FirmQuoteRequest, PublishRfqV2IndicativeQuoteRequest, PublishRfqV2QuoteResponse,
+    RequestRfqV2FirmQuoteRequest, RfqV2AuthorizedTerms, RfqV2AutoExecutionLimit,
+    RfqV2BulkWithdrawalRequest, RfqV2Digest, RfqV2ErrorResponse, RfqV2ExecutionRequest,
+    RfqV2ExecutionResponse, RfqV2FillPolicy, RfqV2InvalidationRequest, RfqV2OperationResponse,
+    RfqV2PackageLeg, RfqV2PreflightStatus, RfqV2ProviderResponse, RfqV2QuoteReplacement,
     RfqV2QuoteView, RfqV2ReadGrant, RfqV2ReplacementRequest, RfqV2Response,
     RfqV2ScheduledQuoteCancelRequest, RfqV2ScheduledQuoteCancelResponse, RfqV2Side,
     RfqV2SweepRequest,
@@ -55,6 +56,7 @@ use crate::{ClientError, HypercallClient, Result};
 pub(crate) const RFQ_V2_ROUTE: &str = "/private/rfqs";
 const RFQ_V2_BULK_WITHDRAWAL_ROUTE: &str = "/private/rfq-quote-withdrawals";
 const RFQ_V2_CANCEL_SCHEDULE_ROUTE: &str = "/private/rfq-quote-cancel-schedule";
+const RFQ_V2_PROVIDER_ROUTE: &str = "/private/rfq-provider";
 
 async fn send_rfq_v2_json<T: DeserializeOwned>(
     request: RequestBuilder,
@@ -612,6 +614,24 @@ impl HypercallClient {
         .await
     }
 
+    /// List committed executions where the signed account is the maker or
+    /// the taker, ascending by durable `sequence`. Save `next_after_sequence`
+    /// and resume from it after a reconnect: every execution appears exactly
+    /// once in cursor order. An `RfqV2Changed` hint is the wake-up signal.
+    pub async fn list_rfq_v2_executions(
+        &self,
+        query: &ListRfqV2ExecutionsQuery,
+        credentials: RfqV2ReadCredentials<'_>,
+    ) -> Result<ListRfqV2ExecutionsResponse> {
+        send_rfq_v2_json(
+            self.request(Method::GET, &format!("{RFQ_V2_ROUTE}/executions"))
+                .query(query)
+                .bearer_auth(credentials.bearer_token),
+            "RFQ v2 execution cursor failed",
+        )
+        .await
+    }
+
     /// List quotes visible to the authorized caller for one RFQ.
     pub async fn list_rfq_v2_quotes(
         &self,
@@ -641,6 +661,20 @@ impl HypercallClient {
             self.request(Method::GET, &route)
                 .bearer_auth(credentials.bearer_token),
             "RFQ v2 quote read failed",
+        )
+        .await
+    }
+
+    /// Read the signed account's own quote-provider enrollment
+    /// (`GET /private/rfq-provider`).
+    pub async fn get_rfq_v2_provider(
+        &self,
+        credentials: RfqV2ReadCredentials<'_>,
+    ) -> Result<RfqV2ProviderResponse> {
+        send_rfq_v2_json(
+            self.request(Method::GET, RFQ_V2_PROVIDER_ROUTE)
+                .bearer_auth(credentials.bearer_token),
+            "RFQ v2 provider read failed",
         )
         .await
     }
@@ -756,13 +790,14 @@ pub(crate) fn parent_fill_policy(parent: &RfqV2Response) -> RfqV2FillPolicy {
     }
 }
 
-/// The parent's signed auto-execution limit, from either role's parent view.
+/// The parent's signed auto-execution limit. Only the taker's view carries
+/// it; the maker view withholds the taker's limit.
 pub(crate) fn parent_auto_execution_limit(
     parent: &RfqV2Response,
 ) -> Option<RfqV2AutoExecutionLimit> {
     match &parent.parent {
         RfqV2AuthorizedTerms::Taker { terms } => terms.auto_execution_limit,
-        RfqV2AuthorizedTerms::Maker { terms } => terms.auto_execution_limit,
+        RfqV2AuthorizedTerms::Maker { .. } => None,
     }
 }
 

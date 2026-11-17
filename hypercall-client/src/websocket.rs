@@ -83,7 +83,7 @@ use crate::rfq_v2::encode_rfq_v2_read_grant;
 use crate::wallet::AccountAddress;
 #[cfg(feature = "rfq-v2")]
 use hypercall_sdk_types::rfq_v2::RfqV2ReadGrant;
-use hypercall_sdk_types::ws_protocol::WsMessage;
+use hypercall_sdk_types::ws_protocol::{RfqV2View, WsMessage};
 use hypercall_ws_protocol::{WsChannel, WsSlowConsumerCloseReason};
 
 /// Original indicative channel: one `IndicativeMarketData` frame per row.
@@ -284,11 +284,25 @@ impl DesiredSubscription {
         expiry: Option<String>,
         option_type: Option<String>,
     ) -> Result<Self> {
+        Self::with_view(channel, symbols, expiry, option_type, None)
+    }
+
+    /// `view` (`rfq_v2` only) is encoded into the subscribe frame and is not
+    /// part of the filter, so a later subscribe with another view replaces
+    /// the earlier one.
+    fn with_view(
+        channel: &str,
+        symbols: Option<Vec<String>>,
+        expiry: Option<String>,
+        option_type: Option<String>,
+        view: Option<RfqV2View>,
+    ) -> Result<Self> {
         let subscribe = sonic_rs::to_string(&WsMessage::Subscribe {
             channel: channel.to_string(),
             symbols: symbols.clone(),
             expiry: expiry.clone(),
             option_type: option_type.clone(),
+            view,
         })?;
         let unsubscribe = sonic_rs::to_string(&WsMessage::Unsubscribe {
             channel: channel.to_string(),
@@ -326,6 +340,10 @@ struct WsClientShared {
     /// A v2 confirmation without the marker arrived and the switch to v1 has
     /// not been applied yet.
     v2_fallback_pending: AtomicBool,
+    /// The RFQ V2 read grant the session authenticates with, replaced by
+    /// [`WsClient::reauthenticate_rfq_v2`] and presented again on reconnect.
+    #[cfg(feature = "rfq-v2")]
+    rfq_v2_grant: StdMutex<Option<RfqV2SocketGrant>>,
 }
 
 /// What [`WsClient::release_where`] does with one stored subscription.
@@ -350,38 +368,45 @@ pub struct WsClient {
 }
 
 #[cfg(feature = "rfq-v2")]
+#[derive(Clone)]
 struct RfqV2SocketGrant {
     token: String,
     account: String,
     expires_at_ms: u64,
 }
 
-/// The identity a session presents after every (re)connect.
+/// The identity a session presents after every (re)connect. An RFQ V2
+/// session's grant lives in [`WsClientShared`], since it can be replaced on
+/// the live connection.
 struct SessionCredentials {
     wallet: Option<String>,
-    #[cfg(feature = "rfq-v2")]
-    rfq_v2_grant: Option<RfqV2SocketGrant>,
 }
 
 impl SessionCredentials {
     fn wallet(wallet: Option<String>) -> Self {
-        Self {
-            wallet,
-            #[cfg(feature = "rfq-v2")]
-            rfq_v2_grant: None,
-        }
+        Self { wallet }
     }
+}
 
-    /// Wall-clock expiry of the session's RFQ V2 read grant, if it has one.
-    fn rfq_v2_expires_at_ms(&self) -> Option<u64> {
-        #[cfg(feature = "rfq-v2")]
-        {
-            self.rfq_v2_grant.as_ref().map(|grant| grant.expires_at_ms)
-        }
-        #[cfg(not(feature = "rfq-v2"))]
-        {
-            None
-        }
+#[cfg(feature = "rfq-v2")]
+fn current_rfq_v2_grant(shared: &WsClientShared) -> Option<RfqV2SocketGrant> {
+    shared
+        .rfq_v2_grant
+        .lock()
+        .expect("WebSocket RFQ grant mutex poisoned")
+        .clone()
+}
+
+/// Wall-clock expiry of the session's current RFQ V2 read grant, if any.
+fn rfq_v2_expires_at_ms(shared: &WsClientShared) -> Option<u64> {
+    #[cfg(feature = "rfq-v2")]
+    {
+        current_rfq_v2_grant(shared).map(|grant| grant.expires_at_ms)
+    }
+    #[cfg(not(feature = "rfq-v2"))]
+    {
+        let _ = shared;
+        None
     }
 }
 
@@ -414,6 +439,8 @@ impl WsClient {
                 batched_indicative: AtomicBool::new(true),
                 v2_unsupported: AtomicBool::new(false),
                 v2_fallback_pending: AtomicBool::new(false),
+                #[cfg(feature = "rfq-v2")]
+                rfq_v2_grant: StdMutex::new(None),
             }),
             config,
             options: ConnectOptions {
@@ -471,22 +498,93 @@ impl WsClient {
     }
 
     /// Connect using a signed private RFQ read grant. The grant is sent again
-    /// before subscriptions on reconnect. Once it expires, sign a fresh grant
-    /// and create a new session; no unsigned wallet identity grants RFQ access.
+    /// before subscriptions on reconnect.
+    ///
+    /// When the grant lapses the server keeps the connection and its
+    /// subscriptions, and sends one `Error` with `code`
+    /// `rfq_v2_grant_expired` (delivered like any other message) when it
+    /// withholds a change. Sign a fresh grant and call
+    /// [`WsClient::reauthenticate_rfq_v2`], ideally before expiry. A reconnect
+    /// with an expired grant ends the session; no unsigned wallet identity
+    /// grants RFQ access.
     #[cfg(feature = "rfq-v2")]
     pub async fn connect_rfq_v2(&self, base_url: &str, grant: &RfqV2ReadGrant) -> Result<()> {
-        self.start_session(
-            base_url,
-            SessionCredentials {
-                wallet: None,
-                rfq_v2_grant: Some(RfqV2SocketGrant {
-                    token: encode_rfq_v2_read_grant(grant)?,
-                    account: grant.account.to_string(),
-                    expires_at_ms: grant.expires_at_ms,
-                }),
-            },
-        )
-        .await
+        let socket_grant = RfqV2SocketGrant {
+            token: encode_rfq_v2_read_grant(grant)?,
+            account: grant.account.to_string(),
+            expires_at_ms: grant.expires_at_ms,
+        };
+        if self.shared.started.load(Ordering::Acquire) {
+            return Err(ClientError::WebSocket(
+                "WebSocket client is already connected or connecting".to_string(),
+            ));
+        }
+        *self
+            .shared
+            .rfq_v2_grant
+            .lock()
+            .expect("WebSocket RFQ grant mutex poisoned") = Some(socket_grant);
+        let result = self
+            .start_session(base_url, SessionCredentials { wallet: None })
+            .await;
+        if result.is_err() {
+            *self
+                .shared
+                .rfq_v2_grant
+                .lock()
+                .expect("WebSocket RFQ grant mutex poisoned") = None;
+        }
+        result
+    }
+
+    /// Present a fresh RFQ read grant on the live connection, for the same
+    /// account. Subscriptions stay; the grant is also used for later
+    /// reconnects. `Ok` means the `AuthenticateRfqV2` frame was sent (or will
+    /// be sent by the reconnect in progress); observe `RfqV2Authenticated`
+    /// or `Error` for the server's answer.
+    #[cfg(feature = "rfq-v2")]
+    pub async fn reauthenticate_rfq_v2(&self, grant: &RfqV2ReadGrant) -> Result<()> {
+        let socket_grant = RfqV2SocketGrant {
+            token: encode_rfq_v2_read_grant(grant)?,
+            account: grant.account.to_string(),
+            expires_at_ms: grant.expires_at_ms,
+        };
+        {
+            let mut current = self
+                .shared
+                .rfq_v2_grant
+                .lock()
+                .expect("WebSocket RFQ grant mutex poisoned");
+            match current.as_ref() {
+                None => {
+                    return Err(ClientError::WebSocket(
+                        "not an RFQ V2 session; use connect_rfq_v2".to_string(),
+                    ))
+                }
+                Some(existing) if !existing.account.eq_ignore_ascii_case(&socket_grant.account) => {
+                    return Err(ClientError::InvalidInput(
+                        "RFQ read grant is for a different account than the session".to_string(),
+                    ))
+                }
+                Some(_) => {}
+            }
+            *current = Some(socket_grant.clone());
+        }
+        let frame = sonic_rs::to_string(&WsMessage::AuthenticateRfqV2 {
+            token: socket_grant.token,
+        })?;
+        let tx = self
+            .shared
+            .tx
+            .lock()
+            .expect("WebSocket sender mutex poisoned")
+            .clone();
+        if let Some(tx) = tx {
+            tx.send(tungstenite::Message::Text(frame))
+                .await
+                .map_err(|e| ClientError::WebSocket(format!("Failed to send: {}", e)))?;
+        }
+        Ok(())
     }
 
     async fn start_session(&self, base_url: &str, credentials: SessionCredentials) -> Result<()> {
@@ -601,6 +699,19 @@ impl WsClient {
             .await
     }
 
+    /// [`WsClient::subscribe_rfq_v2`] with an explicit delivery view.
+    /// [`RfqV2View::Full`] delivers `RfqV2Rfq` frames carrying the account's
+    /// RFQ read (decode them with
+    /// [`crate::rfq_v2_recovery::rfq_v2_full_read`]), falling back to
+    /// `RfqV2Changed` for a change whose read the server could not build.
+    /// The view is kept across reconnects; subscribing again with another
+    /// view replaces it.
+    #[cfg(feature = "rfq-v2")]
+    pub async fn subscribe_rfq_v2_with_view(&self, view: RfqV2View) -> Result<()> {
+        let desired = DesiredSubscription::with_view("rfq_v2", None, None, None, Some(view))?;
+        self.subscribe_entry(desired, false).await
+    }
+
     /// Remove the RFQ V2 subscription, including its reconnect intent.
     #[cfg(feature = "rfq-v2")]
     pub async fn unsubscribe_rfq_v2(&self) -> Result<()> {
@@ -691,7 +802,19 @@ impl WsClient {
             return Err(ClientError::WebSocket("Not connected".to_string()));
         }
 
-        let mut desired = DesiredSubscription::new(channel, symbols, expiry, option_type)?;
+        let desired = DesiredSubscription::new(channel, symbols, expiry, option_type)?;
+        self.subscribe_entry(desired, logical_indicative).await
+    }
+
+    async fn subscribe_entry(
+        &self,
+        mut desired: DesiredSubscription,
+        logical_indicative: bool,
+    ) -> Result<()> {
+        if !self.shared.started.load(Ordering::Acquire) {
+            return Err(ClientError::WebSocket("Not connected".to_string()));
+        }
+        let channel = desired.channel.clone();
         desired.logical_indicative = logical_indicative;
         desired.direct = !logical_indicative;
         let frame = tungstenite::Message::Text(desired.subscribe.clone());
@@ -1047,6 +1170,13 @@ fn set_state(shared: &WsClientShared, next: WsConnectionState) {
 
 fn finish_session(shared: &WsClientShared) {
     *shared.tx.lock().expect("WebSocket sender mutex poisoned") = None;
+    #[cfg(feature = "rfq-v2")]
+    {
+        *shared
+            .rfq_v2_grant
+            .lock()
+            .expect("WebSocket RFQ grant mutex poisoned") = None;
+    }
     shared.started.store(false, Ordering::Release);
     set_state(shared, WsConnectionState::Disconnected);
 }
@@ -1535,30 +1665,17 @@ async fn run_connected_socket<S>(
     shared: &WsClientShared,
     outbound_rx: &mut mpsc::Receiver<tungstenite::Message>,
     shutdown_rx: &mut watch::Receiver<bool>,
-    rfq_v2_expires_at_ms: Option<u64>,
 ) -> SessionStop
 where
     S: futures::Sink<tungstenite::Message, Error = tungstenite::Error>
         + futures::Stream<Item = std::result::Result<tungstenite::Message, tungstenite::Error>>
         + Unpin,
 {
-    let grant_expiry = async {
-        if let Some(expires_at_ms) = rfq_v2_expires_at_ms {
-            let remaining_ms = current_unix_ms().map_or(0, |now| expires_at_ms.saturating_sub(now));
-            tokio::time::sleep(Duration::from_millis(remaining_ms)).await;
-        } else {
-            std::future::pending::<()>().await;
-        }
-    };
-    tokio::pin!(grant_expiry);
+    // A lapsed RFQ V2 grant does not end the session: the server keeps the
+    // subscription and sends `rfq_v2_grant_expired`, which is recorded like
+    // any message, and `reauthenticate_rfq_v2` sends a fresh grant.
     loop {
         tokio::select! {
-            _ = &mut grant_expiry => {
-                let _ = socket.send(tungstenite::Message::Close(None)).await;
-                return SessionStop::NonReconnectable(WsDisconnectReason::Protocol(
-                    "RFQ V2 read grant expired; sign a fresh grant".to_string(),
-                ));
-            }
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
                     let _ = socket.send(tungstenite::Message::Close(None)).await;
@@ -1638,8 +1755,7 @@ async fn run_ws_session(
             }
         }
 
-        if credentials
-            .rfq_v2_expires_at_ms()
+        if rfq_v2_expires_at_ms(&shared)
             .is_some_and(|expires_at_ms| current_unix_ms().is_none_or(|now| now >= expires_at_ms))
         {
             let reason = WsDisconnectReason::Protocol(
@@ -1711,7 +1827,7 @@ async fn run_ws_session(
             }
 
             #[cfg(feature = "rfq-v2")]
-            if let Some(grant) = credentials.rfq_v2_grant.as_ref() {
+            if let Some(grant) = current_rfq_v2_grant(&shared).as_ref() {
                 set_state(&shared, WsConnectionState::Authenticating);
                 authenticate_rfq_v2_socket(
                     &mut socket,
@@ -1830,15 +1946,7 @@ async fn run_ws_session(
         reconnecting = true;
         let connected_at = tokio::time::Instant::now();
 
-        match run_connected_socket(
-            &mut socket,
-            &shared,
-            &mut outbound_rx,
-            &mut shutdown_rx,
-            credentials.rfq_v2_expires_at_ms(),
-        )
-        .await
-        {
+        match run_connected_socket(&mut socket, &shared, &mut outbound_rx, &mut shutdown_rx).await {
             SessionStop::Shutdown => {
                 finish_session(&shared);
                 return;
@@ -1877,292 +1985,5 @@ mod reconnect_tests;
 mod deflate_tests;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use sonic_rs::JsonValueTrait;
-
-    #[test]
-    fn test_ws_client_new() {
-        let client = WsClient::new();
-        // Client should be created successfully
-        assert!(client.shared.messages.try_lock().is_ok());
-        assert!(client.shared.pongs.try_lock().is_ok());
-        assert!(client.shared.tx.try_lock().is_ok());
-    }
-
-    #[test]
-    fn test_ws_client_default() {
-        let client = WsClient::default();
-        assert!(client.shared.messages.try_lock().is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_ws_client_get_messages_empty() {
-        let client = WsClient::new();
-        let messages = client.get_messages().await;
-        assert!(messages.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_ws_client_clear_messages() {
-        let client = WsClient::new();
-        // Add a message manually
-        client
-            .shared
-            .messages
-            .lock()
-            .await
-            .push(sonic_rs::json!({"test": "value"}));
-        assert_eq!(client.get_messages().await.len(), 1);
-
-        // Clear messages
-        client.clear_messages().await;
-        assert!(client.get_messages().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_ws_client_count_messages() {
-        let client = WsClient::new();
-        // Add some messages
-        {
-            let mut messages = client.shared.messages.lock().await;
-            messages.push(sonic_rs::json!({"type": "order", "id": 1}));
-            messages.push(sonic_rs::json!({"type": "trade", "id": 2}));
-            messages.push(sonic_rs::json!({"type": "order", "id": 3}));
-        }
-
-        let order_count = client
-            .count_messages(|m| m.get("type").and_then(|t| t.as_str()) == Some("order"))
-            .await;
-        assert_eq!(order_count, 2);
-
-        let trade_count = client
-            .count_messages(|m| m.get("type").and_then(|t| t.as_str()) == Some("trade"))
-            .await;
-        assert_eq!(trade_count, 1);
-    }
-
-    #[tokio::test]
-    async fn test_ws_client_subscribe_not_connected() {
-        let client = WsClient::new();
-        let result = client.subscribe(vec!["orders"]).await;
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            crate::error::ClientError::WebSocket(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_ws_client_ping_not_connected() {
-        let client = WsClient::new();
-        let result = client.ping().await;
-        assert!(matches!(
-            result.unwrap_err(),
-            crate::error::ClientError::WebSocket(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_ws_client_sends_ping_with_payload() {
-        let client = WsClient::new();
-        let (tx, mut rx) = mpsc::channel(1);
-        *client
-            .shared
-            .tx
-            .lock()
-            .expect("WebSocket sender mutex poisoned") = Some(tx);
-
-        client.ping_with_payload(b"health".to_vec()).await.unwrap();
-
-        match rx.recv().await.unwrap() {
-            tungstenite::Message::Ping(payload) => assert_eq!(payload, b"health"),
-            other => panic!("Expected ping frame, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_ws_client_rejects_oversized_ping_payload() {
-        let client = WsClient::new();
-        let (tx, _rx) = mpsc::channel(1);
-        *client
-            .shared
-            .tx
-            .lock()
-            .expect("WebSocket sender mutex poisoned") = Some(tx);
-
-        let result = client.ping_with_payload(vec![0; 126]).await;
-        assert!(matches!(
-            result.unwrap_err(),
-            crate::error::ClientError::WebSocket(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_ws_client_tracks_received_pongs() {
-        let client = WsClient::new();
-        client.shared.pongs.lock().await.push(b"health".to_vec());
-
-        let pong = client
-            .wait_for_pong(|payload| payload == b"health", 100)
-            .await;
-        assert_eq!(pong, Some(b"health".to_vec()));
-
-        client.clear_pongs().await;
-        assert!(client.get_pongs().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_ws_client_responds_to_server_ping() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-            ws.send(tungstenite::Message::Ping(b"server".to_vec()))
-                .await
-                .unwrap();
-
-            match tokio::time::timeout(Duration::from_secs(1), ws.next())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap()
-            {
-                tungstenite::Message::Pong(payload) => assert_eq!(payload, b"server"),
-                other => panic!("Expected pong frame, got {other:?}"),
-            }
-        });
-
-        let client = WsClient::new();
-        client
-            .connect(&format!("http://{}", addr), None)
-            .await
-            .unwrap();
-
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_ws_client_wait_for_message_timeout() {
-        let client = WsClient::new();
-
-        // Wait for a message that doesn't exist with short timeout
-        let result = client
-            .wait_for_message(|m| m.get("never").is_some(), 100)
-            .await;
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_ws_client_wait_for_message_found() {
-        let client = WsClient::new();
-
-        // Add a message in a background task after a delay
-        let messages = client.shared.messages.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            messages.lock().await.push(sonic_rs::json!({"found": true}));
-        });
-
-        let result = client
-            .wait_for_message(|m| m.get("found").is_some(), 500)
-            .await;
-        assert!(result.is_some());
-        assert_eq!(result.unwrap()["found"], true);
-    }
-
-    #[test]
-    fn test_ws_message_subscribe_serialize() {
-        let msg = WsMessage::Subscribe {
-            channel: "orders".to_string(),
-            symbols: None,
-            expiry: None,
-            option_type: None,
-        };
-        let json = sonic_rs::to_string(&msg).unwrap();
-        assert!(json.contains("Subscribe"));
-        assert!(json.contains("orders"));
-    }
-
-    #[test]
-    fn test_ws_message_unsubscribe_serialize() {
-        let msg = WsMessage::Unsubscribe {
-            channel: "trades".to_string(),
-            symbols: None,
-            expiry: None,
-            option_type: None,
-        };
-        let json = sonic_rs::to_string(&msg).unwrap();
-        assert!(json.contains("Unsubscribe"));
-        assert!(json.contains("trades"));
-    }
-
-    #[test]
-    fn test_ws_message_subscribed_deserialize() {
-        let json = r#"{"type": "Subscribed", "channel": "orders"}"#;
-        let msg: WsMessage = sonic_rs::from_str(json).unwrap();
-        match msg {
-            WsMessage::Subscribed { channel, .. } => assert_eq!(channel, "orders"),
-            _ => panic!("Expected Subscribed variant"),
-        }
-    }
-
-    #[test]
-    fn test_ws_message_unsubscribed_deserialize() {
-        let json = r#"{"type": "Unsubscribed", "channel": "trades"}"#;
-        let msg: WsMessage = sonic_rs::from_str(json).unwrap();
-        match msg {
-            WsMessage::Unsubscribed { channel } => assert_eq!(channel, "trades"),
-            _ => panic!("Expected Unsubscribed variant"),
-        }
-    }
-
-    #[test]
-    fn test_ws_message_error_deserialize() {
-        let json = r#"{"type": "Error", "message": "invalid channel"}"#;
-        let msg: WsMessage = sonic_rs::from_str(json).unwrap();
-        match msg {
-            WsMessage::Error { message, .. } => assert_eq!(message, "invalid channel"),
-            _ => panic!("Expected Error variant"),
-        }
-    }
-
-    #[test]
-    fn test_ws_message_unknown_type_deserialize() {
-        let json = r#"{"type": "unknown_type", "data": "something"}"#;
-        let msg: WsMessage = sonic_rs::from_str(json).unwrap();
-        match msg {
-            WsMessage::Other => {}
-            _ => panic!("Expected Other variant"),
-        }
-    }
-
-    #[test]
-    fn test_ws_message_debug() {
-        let msg = WsMessage::Subscribe {
-            channel: "orders".to_string(),
-            symbols: None,
-            expiry: None,
-            option_type: None,
-        };
-        let debug = format!("{:?}", msg);
-        assert!(debug.contains("Subscribe"));
-        assert!(debug.contains("orders"));
-    }
-
-    #[test]
-    fn test_ws_message_clone() {
-        let msg = WsMessage::Error {
-            code: None,
-            channel: None,
-            message: "test error".to_string(),
-        };
-        let cloned = msg.clone();
-        match cloned {
-            WsMessage::Error { message, .. } => assert_eq!(message, "test error"),
-            _ => panic!("Clone failed"),
-        }
-    }
-}
+#[path = "websocket_test.rs"]
+mod tests;

@@ -7,7 +7,7 @@ use proptest::prelude::*;
 
 use super::*;
 
-const KEY: &str = "0x59c6995e998f97a5a0044966f094538e5b2f9f8c9360f0c2b3b8a4e1f2f8f96d";
+const KEY: &str = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
 const CHAIN_ID: u64 = 998;
 
 fn wallet() -> HypercallWallet {

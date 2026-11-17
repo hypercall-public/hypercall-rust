@@ -229,10 +229,10 @@ async fn rejected_rfq_v2_grant_does_not_start_an_unauthenticated_session() {
 
 #[cfg(feature = "rfq-v2")]
 #[tokio::test]
-async fn rfq_v2_socket_stops_when_its_signed_read_grant_expires() {
+async fn rfq_v2_full_view_survives_grant_expiry_and_reauthenticates_in_place() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let account = "0x00000000000000000000000000000000000000a1"
+    let account: hypercall_sdk_types::WalletAddress = "0x00000000000000000000000000000000000000a1"
         .parse()
         .unwrap();
     let now_ms = std::time::SystemTime::now()
@@ -242,10 +242,18 @@ async fn rfq_v2_socket_stops_when_its_signed_read_grant_expires() {
     let grant = RfqV2ReadGrant {
         account,
         issued_at_ms: now_ms,
-        expires_at_ms: now_ms + 750,
+        expires_at_ms: now_ms + 200,
         nonce: 18,
         signature: format!("0x{}1b", "11".repeat(64)).parse().unwrap(),
     };
+    let fresh = RfqV2ReadGrant {
+        issued_at_ms: now_ms + 100,
+        expires_at_ms: now_ms + 300_000,
+        nonce: 19,
+        ..grant
+    };
+    let fresh_token = encode_rfq_v2_read_grant(&fresh).unwrap();
+    let (expired_tx, expired_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -256,12 +264,37 @@ async fn rfq_v2_socket_stops_when_its_signed_read_grant_expires() {
             )))
             .await
             .unwrap();
-        assert!(matches!(
-            timeout(Duration::from_secs(2), socket.next())
-                .await
-                .unwrap(),
-            Some(Ok(tungstenite::Message::Close(_)))
-        ));
+        let subscribe = acknowledge_subscription(&mut socket, "rfq_v2").await;
+        assert_eq!(subscribe["view"], "full");
+        // Past the grant's expiry the socket stays open; the server reports it.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        socket
+            .send(tungstenite::Message::Text(
+                r#"{"type":"Error","message":"RFQ V2 read grant expired","code":"rfq_v2_grant_expired","channel":"rfq_v2"}"#
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        expired_tx.send(()).unwrap();
+        // The fresh grant arrives on the same socket, with no resubscribe.
+        let reauth = next_text(&mut socket).await;
+        assert_eq!(reauth["type"], "AuthenticateRfqV2");
+        assert_eq!(reauth["token"], fresh_token);
+        socket
+            .send(tungstenite::Message::Text(format!(
+                r#"{{"type":"RfqV2Authenticated","account":"{account}"}}"#
+            )))
+            .await
+            .unwrap();
+        while let Some(Ok(frame)) = socket.next().await {
+            match frame {
+                tungstenite::Message::Close(_) => break,
+                tungstenite::Message::Text(text) => {
+                    panic!("unexpected client frame after reauthentication: {text}")
+                }
+                _ => {}
+            }
+        }
     });
 
     let client = WsClient::with_config(reconnect_test_config());
@@ -269,15 +302,63 @@ async fn rfq_v2_socket_stops_when_its_signed_read_grant_expires() {
         .connect_rfq_v2(&format!("http://{address}"), &grant)
         .await
         .unwrap();
-    wait_for_state(&client, |state| {
-        matches!(state, WsConnectionState::Disconnected)
-    })
-    .await;
-    assert!(matches!(
-        client.last_disconnect_reason(),
-        Some(WsDisconnectReason::Protocol(reason)) if reason.contains("read grant expired")
-    ));
+    client
+        .subscribe_rfq_v2_with_view(RfqV2View::Full)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), expired_rx)
+        .await
+        .expect("server never reported the expired grant")
+        .unwrap();
+    let error = client
+        .wait_for_message(
+            |message| {
+                message.get("code").and_then(|code| code.as_str()) == Some("rfq_v2_grant_expired")
+            },
+            1_000,
+        )
+        .await;
+    assert!(error.is_some(), "the expiry error reaches the caller");
+    assert!(client.connection_state().transport_connected());
+    client.clear_messages().await;
+    client.reauthenticate_rfq_v2(&fresh).await.unwrap();
+    let authenticated = client
+        .wait_for_message(
+            |message| {
+                message.get("type").and_then(|kind| kind.as_str()) == Some("RfqV2Authenticated")
+            },
+            1_000,
+        )
+        .await;
+    assert!(authenticated.is_some());
+    assert!(client.connection_state().transport_connected());
+
+    // A grant for another account is refused locally.
+    let other = RfqV2ReadGrant {
+        account: "0x00000000000000000000000000000000000000b2"
+            .parse()
+            .unwrap(),
+        ..fresh
+    };
+    assert!(client.reauthenticate_rfq_v2(&other).await.is_err());
+    client.disconnect().await;
     server.await.unwrap();
+}
+
+#[cfg(feature = "rfq-v2")]
+#[tokio::test]
+async fn reauthenticate_rfq_v2_refuses_a_wallet_session() {
+    let client = WsClient::with_config(reconnect_test_config());
+    let grant = RfqV2ReadGrant {
+        account: "0x00000000000000000000000000000000000000a1"
+            .parse()
+            .unwrap(),
+        issued_at_ms: 1_900_000_000_000,
+        expires_at_ms: 1_900_000_030_000,
+        nonce: 1,
+        signature: format!("0x{}1b", "11".repeat(64)).parse().unwrap(),
+    };
+    assert!(client.reauthenticate_rfq_v2(&grant).await.is_err());
 }
 
 #[cfg(feature = "rfq-v2")]

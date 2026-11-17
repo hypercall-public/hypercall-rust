@@ -55,6 +55,10 @@ pub enum WsMessage {
         expiry: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         option_type: Option<String>,
+        /// `rfq_v2` only: `hint` (the default) sends `RfqV2Changed`; `full`
+        /// sends `RfqV2Rfq` with the account's RFQ read when it can be built.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<RfqV2View>,
     },
     /// Unsubscribe from a data channel
     Unsubscribe {
@@ -141,6 +145,10 @@ pub enum WsMessage {
     #[cfg(feature = "rfq-v2")]
     /// Opt-in RFQ V2 change hint; read the change feed through private reads.
     RfqV2Changed(WsRfqV2Changed),
+    #[cfg(feature = "rfq-v2")]
+    /// RFQ V2 change with the account's current RFQ read, sent instead of
+    /// `RfqV2Changed` to an `rfq_v2` subscription with `view: "full"`.
+    RfqV2Rfq(WsRfqV2Rfq),
     /// Submit an RFQ request via WebSocket (authenticated)
     SubmitRfq {
         rfq_id: String,
@@ -321,6 +329,8 @@ const KNOWN_WS_MESSAGE_TAGS: &[&str] = &[
     "RfqV2Authenticated",
     #[cfg(feature = "rfq-v2")]
     "RfqV2Changed",
+    #[cfg(feature = "rfq-v2")]
+    "RfqV2Rfq",
     "SubmitRfq",
     "SubmitAutoExecuteRfq",
     "AcceptRfqQuote",
@@ -451,6 +461,32 @@ pub struct WsRfqV2Changed {
     pub quote_id: Option<String>,
 }
 
+/// How an `rfq_v2` subscription receives changes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum RfqV2View {
+    /// `RfqV2Changed` hints; read the RFQ over HTTP.
+    #[default]
+    Hint,
+    /// `RfqV2Rfq` frames carrying the RFQ read, falling back to a hint for
+    /// any change whose read cannot be built.
+    Full,
+}
+
+/// One RFQ V2 change with the subscriber's RFQ read.
+#[cfg(feature = "rfq-v2")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct WsRfqV2Rfq {
+    /// Durable change sequence, as in `RfqV2Changed`.
+    pub sequence: u64,
+    /// Exactly the `GET /private/rfqs/{rfq_id}` response body for the
+    /// authenticated account, read after the change committed.
+    #[cfg_attr(feature = "schemars", schemars(with = "serde_json::Value"))]
+    pub rfq: Box<crate::rfq_v2::RfqV2Response>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct WsRfqLegRequest {
@@ -496,6 +532,18 @@ pub struct WsFillUpdate {
     #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub builder_code_fee: Option<Decimal>,
     pub instrument_type: String,
+    /// RFQ V2 attribution, present on every RFQ V2 leg fill (maker and
+    /// taker side) and omitted otherwise. `execution_id` matches the
+    /// `execution_id` of `GET /private/rfqs/executions` and `GET /fills`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    pub rfq_id: Option<uuid::Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    pub quote_id: Option<uuid::Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    pub execution_id: Option<uuid::Uuid>,
 }
 
 impl WsFillUpdate {
@@ -533,10 +581,12 @@ pub enum PortfolioUpdate {
     },
     MarginUpdate {
         span_margin: SpanMarginSummary,
-        margin_summary: MarginSummary,
+        margin_summary: Box<MarginSummary>,
         margin_mode: String,
         total_margin_used: Decimal,
         available_balance: Decimal,
+        /// Same cash capacity as REST portfolio; null means unavailable, not zero.
+        spot_available_usdc: Option<Decimal>,
         timestamp: i64,
     },
     GreeksUpdate {

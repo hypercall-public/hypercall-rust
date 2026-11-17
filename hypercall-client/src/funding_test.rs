@@ -103,6 +103,7 @@ fn portfolio(wallet_address: AccountAddress, margin_mode: &str) -> Portfolio {
         positions: Vec::new(),
         total_margin_used: Decimal::ZERO,
         available_balance: dec!(100),
+        spot_available_usdc: None,
         withdrawable_usdc: None,
         portfolio_snapshot_timestamp_ms: None,
         span_margin: None,

@@ -354,9 +354,11 @@ pub struct RfqV2MakerTerms {
     #[serde(with = "json_u128")]
     pub target: u128,
     pub fill_policy: RfqV2FillPolicy,
+    /// The taker's `auto_execution_limit` is private: a maker learns only
+    /// that the RFQ executes automatically, never the premium bound, so it
+    /// cannot price to the taker's limit. Quotes bind the parent through
+    /// `terms_commitment`, so a maker never needs the raw limit to sign.
     pub execution_mode: RfqV2ExecutionMode,
-    #[serde(default)]
-    pub auto_execution_limit: Option<RfqV2AutoExecutionLimit>,
     pub quote_policy: RfqV2QuotePolicy,
     pub taker_identity: RfqV2TakerIdentity,
     pub quote_deadline_ms: u64,
@@ -655,6 +657,46 @@ pub struct RfqV2ReplacementRequest<T> {
 pub struct RfqV2OperationResponse {
     pub operation_id: Uuid,
     pub status: String,
+    /// Set only on a bulk withdrawal with `rfq` or `all_open` scope: the
+    /// maker's engine generation read after the withdrawal committed. Sign
+    /// fresh firm quotes with it instead of re-reading every RFQ.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maker_generation: Option<u64>,
+    /// Set only on a bulk withdrawal with `rfq` scope: the maker's generation
+    /// for that RFQ, read after the withdrawal committed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rfq_generation: Option<u64>,
+    /// Per-quote outcome of a bulk withdrawal by quote IDs, in request
+    /// order. Absent for every other operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub results: Option<Vec<RfqV2BulkWithdrawalTargetResult>>,
+}
+
+/// What a bulk withdrawal by quote IDs did to one named quote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RfqV2BulkWithdrawalTargetStatus {
+    /// The quote is withdrawn: this request retired it, or a maker
+    /// withdrawal (or a due cancel schedule) already had.
+    Withdrawn,
+    /// The quote had already stopped being executable another way (filled,
+    /// expired, or replaced), so there was nothing to withdraw.
+    AlreadyInactive,
+    /// No firm quote of this maker under that RFQ: unknown, indicative, or
+    /// another maker's quote, which look alike.
+    NotFound,
+    /// The quote was signed with `withdrawal_policy: not_permitted`.
+    NotPermitted,
+    /// The quote's signer no longer has authority for the maker account, or
+    /// the parent's signer for the taker account.
+    Unauthorized,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RfqV2BulkWithdrawalTargetResult {
+    pub rfq_id: Uuid,
+    pub quote_id: Uuid,
+    pub status: RfqV2BulkWithdrawalTargetStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -801,6 +843,88 @@ pub struct ListRfqV2ChangesResponse {
     pub changes: Vec<RfqV2ChangeHint>,
     pub next_after_sequence: u64,
     pub has_more: bool,
+}
+
+// ---- Account execution cursor (`GET /private/rfqs/executions`) ----
+
+/// Cursor through committed executions where the read account is the maker
+/// or the taker. `after_sequence` defaults to 0, `limit` to 100 (1..=500).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListRfqV2ExecutionsQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// The read account's role in one execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RfqV2ExecutionRole {
+    Maker,
+    Taker,
+}
+
+/// One executed leg, seen from the read account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RfqV2AccountExecutionLeg {
+    pub instrument: String,
+    /// The read account's side on this leg.
+    pub side: RfqV2Side,
+    /// Contracts times 10^6: `package_units * quantity_micros_per_unit / 10^6`.
+    #[serde(with = "json_u128")]
+    pub quantity_micros: u128,
+    /// The maker-signed quote leg price, USD per contract times 10^6.
+    #[serde(with = "json_u128")]
+    pub price_micros: u128,
+}
+
+/// One committed allocation (execution) at its cursor position.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RfqV2AccountExecution {
+    /// Durable, strictly increasing cursor position.
+    pub sequence: u64,
+    /// Matches `execution_id` on this execution's `fills` messages and rows.
+    pub execution_id: Uuid,
+    pub rfq_id: Uuid,
+    pub quote_id: Uuid,
+    pub role: RfqV2ExecutionRole,
+    pub maker_account: WalletAddress,
+    /// Micro package units, as in `RfqV2ExecutionFill`.
+    #[serde(with = "json_u128")]
+    pub package_units: u128,
+    /// Builder fee charged in this allocation, as in `RfqV2ExecutionFill`.
+    #[serde(with = "json_u128")]
+    pub fee_micros: u128,
+    pub executed_at_ms: u64,
+    pub legs: Vec<RfqV2AccountExecutionLeg>,
+}
+
+/// One page of the account execution cursor. Resume from
+/// `next_after_sequence`; it equals the request cursor on an empty page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListRfqV2ExecutionsResponse {
+    pub executions: Vec<RfqV2AccountExecution>,
+    pub next_after_sequence: u64,
+    pub has_more: bool,
+}
+
+/// `GET /private/rfq-provider`: the signed read account's own quote-provider
+/// enrollment. Enrollment fields are `None` (JSON `null`) without an
+/// enrollment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RfqV2ProviderResponse {
+    pub account: WalletAddress,
+    pub enrolled: bool,
+    /// The registered provider wallet whose enrollment routes this account.
+    pub provider: Option<WalletAddress>,
+    /// `active` or `suspended`.
+    pub status: Option<String>,
+    pub tier: Option<String>,
+    /// `None` means every underlying (or no enrollment).
+    pub allowed_underlyings: Option<Vec<String>>,
+    /// Whether `all_eligible` RFQs route to this account: enrolled and active.
+    pub receives_open_rfqs: bool,
 }
 
 /// Stable error body returned by disabled route skeletons and later V2 handlers.

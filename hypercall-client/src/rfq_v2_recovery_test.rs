@@ -297,6 +297,27 @@ fn change_cursor_reads_a_persisted_pending_set_as_its_high_water_mark() {
 }
 
 #[test]
+fn ws_full_read_decodes_the_pushed_rfq_and_ignores_other_frames() {
+    let read = parent(id(10), "open", 5_000_000);
+    let frame = sonic_rs::to_string(&hypercall_sdk_types::ws_protocol::WsMessage::RfqV2Rfq(
+        hypercall_sdk_types::ws_protocol::WsRfqV2Rfq {
+            sequence: 9,
+            rfq: Box::new(read.clone()),
+        },
+    ))
+    .unwrap();
+    let value: sonic_rs::Value = sonic_rs::from_str(&frame).unwrap();
+    let decoded = rfq_v2_full_read(&value).unwrap();
+    assert_eq!(decoded.sequence, 9);
+    assert_eq!(*decoded.rfq, read);
+    let hint: sonic_rs::Value = sonic_rs::from_str(
+        r#"{"type":"RfqV2Changed","rfq_id":"00000000-0000-0000-0000-00000000000a","sequence":7}"#,
+    )
+    .unwrap();
+    assert!(rfq_v2_full_read(&hint).is_none());
+}
+
+#[test]
 fn ws_hint_decoding_ignores_other_frames() {
     let hint: sonic_rs::Value = sonic_rs::from_str(
         r#"{"type":"RfqV2Changed","rfq_id":"00000000-0000-0000-0000-00000000000a","sequence":7}"#,

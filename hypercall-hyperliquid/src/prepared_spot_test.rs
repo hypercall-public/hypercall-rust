@@ -155,3 +155,97 @@ fn spot_pair_index_must_stay_in_the_spot_range() {
     assert!(!is_spot_asset(9_999));
     assert!(!is_spot_asset(100_000));
 }
+
+/// A user spot order carries the builder at zero fee; the
+/// recovery accessor refuses it and the user accessor requires it.
+#[test]
+fn a_user_spot_order_carries_the_builder_and_only_the_user_accessor_reads_it() {
+    let builder = crate::HyperliquidAddress::repeat_byte(0xb1);
+    let order = PreparedSpotLimitOrder {
+        pair_index: 142,
+        is_buy: true,
+        limit_px: d("94000"),
+        size: d("0.01234"),
+        tif: Tif::Gtc,
+        cloid: 7,
+    };
+    let prepared = PreparedHyperliquidAction::prepare_user_spot_order(
+        HyperliquidChain::Mainnet,
+        order.clone(),
+        5,
+        NONCE,
+        EXPIRES_AFTER_MS,
+        builder,
+    )
+    .unwrap();
+    let bytes = prepared.canonical_bytes().unwrap();
+    let decoded = PreparedHyperliquidAction::from_canonical_bytes(&bytes).unwrap();
+    assert_eq!(decoded.user_spot_order().unwrap(), (order.clone(), builder));
+    assert!(decoded.spot_limit_order().is_err());
+    // The recovery order has no builder, so it is no user order.
+    assert!(ubtc_sell().user_spot_order().is_err());
+    assert!(PreparedHyperliquidAction::prepare_user_spot_order(
+        HyperliquidChain::Mainnet,
+        order,
+        5,
+        NONCE,
+        EXPIRES_AFTER_MS,
+        crate::HyperliquidAddress::ZERO,
+    )
+    .is_err());
+}
+
+/// A batch whose first order is the signed one carries no unsigned extra
+/// order or grouping past either accessor, even with a consistent digest.
+#[test]
+fn a_spot_order_is_exactly_one_standalone_order() {
+    let builder = crate::HyperliquidAddress::repeat_byte(0xb1);
+    let order = PreparedSpotLimitOrder {
+        pair_index: 142,
+        is_buy: true,
+        limit_px: d("94000"),
+        size: d("0.01234"),
+        tif: Tif::Gtc,
+        cloid: 7,
+    };
+    let user = PreparedHyperliquidAction::prepare_user_spot_order(
+        HyperliquidChain::Mainnet,
+        order,
+        5,
+        NONCE,
+        EXPIRES_AFTER_MS,
+        builder,
+    )
+    .unwrap();
+    let redigest = |prepared: &mut PreparedHyperliquidAction| {
+        prepared.action_digest = crate::prepared::action_digest(
+            &prepared.action,
+            prepared.chain,
+            prepared.nonce,
+            None,
+            prepared.expires_after_ms,
+        )
+        .unwrap();
+    };
+    for prepared in [user, ubtc_sell()] {
+        let mut appended = prepared.clone();
+        if let Action::Order(batch) = &mut appended.action {
+            let mut extra = batch.orders[0].clone();
+            extra.asset = 0;
+            extra.cloid = cloid_from_u128(8);
+            batch.orders.push(extra);
+        }
+        redigest(&mut appended);
+        assert!(appended.validate().is_ok());
+        assert!(appended.user_spot_order().is_err());
+        assert!(appended.spot_limit_order().is_err());
+
+        let mut grouped = prepared;
+        if let Action::Order(batch) = &mut grouped.action {
+            batch.grouping = OrderGrouping::NormalTpsl;
+        }
+        redigest(&mut grouped);
+        assert!(grouped.user_spot_order().is_err());
+        assert!(grouped.spot_limit_order().is_err());
+    }
+}

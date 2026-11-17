@@ -473,7 +473,7 @@ const BPS_DENOMINATOR: u32 = 10_000;
 const SERVER_CLOCK_TTL: Duration = Duration::from_secs(60);
 const SCALE_WORKING_SCALE: u32 = 12;
 const MAX_BATCH_CLOID_INDEX: usize = 255;
-const HYPERCALL_API_DOMAIN: &str = "HypercallApiSign";
+pub(crate) const HYPERCALL_API_DOMAIN: &str = "HypercallApiSign";
 const HYPERCALL_MANAGER_DOMAIN: &str = "HypercallManagerSign";
 
 sol! {
@@ -861,7 +861,7 @@ fn approval_message(payload: &TeeApiWalletApprovalSignature<'_>) -> HLAddApiWall
     }
 }
 
-fn signing_domain(name: &'static str, chain_id: u64) -> Result<Eip712Domain> {
+pub(crate) fn signing_domain(name: &'static str, chain_id: u64) -> Result<Eip712Domain> {
     if !matches!(chain_id, 998 | 999) {
         return Err(ClientError::InvalidInput(format!(
             "unsupported directive chain id: {chain_id}"
@@ -1470,7 +1470,7 @@ pub fn tee_perp_batch_cloid(nonce: u64, index: usize) -> Result<u128> {
     Ok((u128::from(nonce) << 8) + index as u128 + 1)
 }
 
-fn nonzero_cloid(cloid: u128) -> Result<u128> {
+pub(crate) fn nonzero_cloid(cloid: u128) -> Result<u128> {
     if cloid == 0 {
         return Err(ClientError::InvalidInput("cloid must not be zero".into()));
     }
@@ -1850,36 +1850,10 @@ fn validate_twap_action(action: &TeePerpTwapAction) -> Result<()> {
     Ok(())
 }
 
-/// A signed body whose nonce identifies it to the server.
-trait SignedTeeSubmission: serde::Serialize {
-    fn nonce(&self) -> u64;
-}
-
-impl<A: serde::Serialize> SignedTeeSubmission for DirectiveSubmitRequest<A> {
-    fn nonce(&self) -> u64 {
-        self.nonce
-    }
-}
-
-impl SignedTeeSubmission for TeeApiWalletApprovalSubmitRequest {
-    fn nonce(&self) -> u64 {
-        self.nonce
-    }
-}
-
-/// Whether a failed submission may still have reached the server: any
-/// transport or decode failure, a `408`, or a `5xx`. Other `4xx` answers
-/// are definitive.
-fn tee_submission_is_ambiguous(error: &ClientError) -> bool {
-    matches!(
-        error,
-        ClientError::Http(_)
-            | ClientError::Api {
-                status: 408 | 500..=599,
-                ..
-            }
-    )
-}
+#[path = "tee_perp_submission.rs"]
+mod submission;
+use submission::tee_submission_is_ambiguous;
+pub(crate) use submission::SignedTeeSubmission;
 
 #[path = "tee_perp_preview.rs"]
 mod preview;
@@ -2417,7 +2391,11 @@ impl HypercallClient {
         Ok(next_nonce_at(signer.as_wallet_address().inner(), now))
     }
 
-    async fn resolve_tee_nonce(&self, signer: AccountAddress, nonce: Option<u64>) -> Result<u64> {
+    pub(crate) async fn resolve_tee_nonce(
+        &self,
+        signer: AccountAddress,
+        nonce: Option<u64>,
+    ) -> Result<u64> {
         match nonce {
             Some(nonce) => Ok(nonce),
             None => self.next_tee_perp_nonce(signer).await,
@@ -2435,7 +2413,12 @@ impl HypercallClient {
     /// POST a signed, mutating submission. The body is serialized once and
     /// those exact bytes are sent, so an ambiguous failure can hand them back
     /// in [`ClientError::TeeSubmissionAmbiguous`] for an identical resend.
-    async fn post_tee_signed<T, B>(&self, route: &str, body: &B, action: &str) -> Result<T>
+    pub(crate) async fn post_tee_signed<T, B>(
+        &self,
+        route: &str,
+        body: &B,
+        action: &str,
+    ) -> Result<T>
     where
         T: serde::de::DeserializeOwned,
         B: SignedTeeSubmission,

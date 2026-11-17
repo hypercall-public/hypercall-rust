@@ -28,6 +28,7 @@ pub mod error;
 pub mod funding;
 pub mod indicative;
 pub mod perp;
+pub mod pm_financing;
 pub mod qp_client;
 pub mod qp_scoped;
 pub mod rfq;
@@ -38,6 +39,8 @@ pub mod rfq_v2_recovery;
 #[cfg(feature = "rfq-v2")]
 pub mod rfq_v2_signing;
 pub mod tee_perp;
+pub mod tee_spot;
+pub mod vaults;
 pub mod wallet;
 pub mod websocket;
 
@@ -59,6 +62,12 @@ pub use hypercall_ws_protocol::{
 pub use perp::{
     PerpCancelByCloidParams, PerpCancelByOidParams, PerpLimitOrderParams,
     SetAccountAbstractionParams, UpdateApiWalletParams,
+};
+pub use pm_financing::{
+    PmFinancingItem, PmFinancingItemKind, PmFinancingItemStatus, PmFinancingMargin,
+    PmFinancingRepayment, PmFinancingResponse, PmFinancingTotals, PmLoanRepayResponse,
+    PmLoanRepaymentRequest, PmRepayRejection, PmRepaymentBlockedReason, PmRepaymentStatus,
+    RepayAmount, RepayPmLoanParams,
 };
 pub use qp_client::{
     NoopCallbacks, QpClientCallbacks, QpClientConfig, QpDisconnectReason, QpWriteFailure,
@@ -83,6 +92,15 @@ pub use tee_perp::{
     TeePerpTriggerExecution, TeePerpTriggerOrderParams, TeePerpTriggerOrderSignature,
     TeePerpTwapCancelParams, TeePerpTwapCancelSignature, TeePerpTwapParams, TeePerpTwapSignature,
     PERP_MARKET_SLIPPAGE_BPS,
+};
+pub use tee_spot::{
+    tee_spot_cancel_signing_hash, tee_spot_order_signing_hash, TeeSpotCancelParams,
+    TeeSpotCancelSignature, TeeSpotOrderParams, TeeSpotOrderSignature, TeeSpotSigner,
+};
+pub use vaults::{
+    CreateVaultResponse, Vault, VaultConfigParams, VaultFill, VaultHistoryPage, VaultHolder,
+    VaultMetadata, VaultPage, VaultQueuedRequest, VaultRequestResponse, VaultSettlement,
+    VaultSettlementsPage, VaultStatusChange, VaultStatusChangesPage,
 };
 pub use wallet::{
     AccountAddress, ApiWalletDirectiveSigner, AtomicNonceProvider, CancelOrderSignature,

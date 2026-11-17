@@ -290,6 +290,21 @@ pub fn rfq_v2_change_hint(message: &sonic_rs::Value) -> Option<WsRfqV2Changed> {
     sonic_rs::from_str(&sonic_rs::to_string(message).ok()?).ok()
 }
 
+/// Decode an `RfqV2Rfq` frame (an `rfq_v2` subscription with
+/// [`RfqV2View::Full`](hypercall_sdk_types::ws_protocol::RfqV2View::Full)):
+/// the change's `sequence` and the account's RFQ read, exactly the
+/// `GET /private/rfqs/{rfq_id}` body. Treat its `sequence` like a hint's for
+/// the change cursor.
+pub fn rfq_v2_full_read(
+    message: &sonic_rs::Value,
+) -> Option<hypercall_sdk_types::ws_protocol::WsRfqV2Rfq> {
+    use sonic_rs::JsonValueTrait as _;
+    if message.get("type").as_str() != Some("RfqV2Rfq") {
+        return None;
+    }
+    sonic_rs::from_str(&sonic_rs::to_string(message).ok()?).ok()
+}
+
 /// One object in a private mirror.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum RfqV2MirrorObject {

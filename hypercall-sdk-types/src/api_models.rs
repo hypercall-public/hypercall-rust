@@ -219,6 +219,9 @@ pub struct Portfolio {
     pub total_margin_used: Decimal,
     /// Free collateral available for new trades in USD. Serialized as a string.
     pub available_balance: Decimal,
+    /// Free USDC under the spot-buy cash check, after financing and reservations.
+    /// Null for standard margin or unavailable cash facts; not an order approval.
+    pub spot_available_usdc: Option<Decimal>,
     /// Reservation-netted Account.sol USDC capped by Hypercall
     /// withdrawal-admission margin headroom, then truncated toward zero to
     /// eight decimal places.
@@ -385,48 +388,7 @@ pub struct TradesResponse {
     pub pagination: crate::Pagination,
 }
 
-/// A single fill (one side of a trade) for a specific wallet.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FillApiResponse {
-    /// Unique fill identifier.
-    pub fill_id: i64,
-    /// Parent trade identifier that produced this fill.
-    pub trade_id: i64,
-    /// Wallet that received this fill (checksummed Ethereum address).
-    pub wallet_address: WalletAddress,
-    /// Instrument symbol that was filled.
-    pub symbol: String,
-    /// Execution price in USD. Serialized as a string.
-    pub price: Decimal,
-    /// Fill size in contracts. Serialized as a string.
-    pub size: Decimal,
-    /// Fee charged for this fill in USD. Serialized as a string.
-    pub fee: Decimal,
-    /// Wallet-specific fill side.
-    pub side: crate::Side,
-    /// Whether this fill was on the taker side.
-    pub is_taker: bool,
-    /// Fill timestamp in milliseconds since epoch.
-    pub timestamp: i64,
-    /// When the fill was persisted (ISO 8601).
-    pub created_at: DateTime<Utc>,
-    /// Builder/referral code wallet, if a builder code was used (checksummed Ethereum address).
-    pub builder_code_address: Option<WalletAddress>,
-    /// Fee rebate to the builder code wallet in USD. Serialized as a string.
-    pub builder_code_fee: Option<Decimal>,
-    /// Realized PnL from this fill in USD, if a position was reduced. Serialized as a string.
-    pub realized_pnl: Option<Decimal>,
-    /// Link to the on-chain transaction, if settled.
-    pub explorer_url: Option<String>,
-    /// Instrument family that produced this fill (`"option"` or `"perp"`).
-    pub instrument_type: String,
-}
-
-impl FillApiResponse {
-    pub fn instrument_kind(&self) -> Result<InstrumentKind, ParseSdkEnumError> {
-        self.instrument_type.parse()
-    }
-}
+pub use crate::fill_api::FillApiResponse;
 
 /// Paginated list of fills.
 #[derive(Debug, Serialize, Deserialize)]
@@ -1247,6 +1209,7 @@ mod tests {
             positions: vec![],
             total_margin_used: dec!(0),
             available_balance: dec!(1000),
+            spot_available_usdc: None,
             withdrawable_usdc: None,
             portfolio_snapshot_timestamp_ms: None,
             span_margin: None,
@@ -1369,6 +1332,9 @@ mod tests {
             realized_pnl: Some(dec!(150)),
             explorer_url: None,
             instrument_type: "option".to_string(),
+            rfq_id: None,
+            quote_id: None,
+            execution_id: None,
         };
         let json = serde_json::to_value(&fill).unwrap();
         assert_eq!(json["price"], "2500");

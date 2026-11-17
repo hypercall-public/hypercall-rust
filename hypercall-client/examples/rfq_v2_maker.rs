@@ -31,6 +31,11 @@ use uuid::Uuid;
 const QUOTE_TTL_MS: u64 = 15_000;
 /// Every RFQ quote is withdrawn if the switch is not renewed within this.
 const DEAD_MAN_MS: u64 = 30_000;
+/// Private-read grant lifetime: 4.5 minutes, inside the server's 5-minute
+/// maximum (`MAX_RFQ_READ_GRANT_LIFETIME_MS`).
+const READ_GRANT_LIFETIME_MS: u64 = 270_000;
+/// Sign the next read grant this long before the current one expires.
+const READ_GRANT_RENEW_BEFORE_MS: u64 = 60_000;
 
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
@@ -115,10 +120,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         nonce += 1;
         nonce
     };
-    let grant = wallet
-        .sign_rfq_v2_read_grant(maker, now, now + 600_000, next_nonce())
+    let mut grant = wallet
+        .sign_rfq_v2_read_grant(maker, now, now + READ_GRANT_LIFETIME_MS, next_nonce())
         .await?;
-    let token = encode_rfq_v2_read_grant(&grant)?;
+    let mut token = encode_rfq_v2_read_grant(&grant)?;
     let open_for_me = ListRfqV2Query {
         role: Some(RfqV2Role::Maker),
         status: Some("open".into()),
@@ -128,6 +133,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut answered = HashSet::new();
     for _ in 0..rounds {
         let now = client.server_now_ms().await?;
+
+        // Renew the read grant before it expires; a lapsed grant is refused.
+        if now + READ_GRANT_RENEW_BEFORE_MS >= grant.expires_at_ms {
+            grant = wallet
+                .sign_rfq_v2_read_grant(maker, now, now + READ_GRANT_LIFETIME_MS, next_nonce())
+                .await?;
+            token = encode_rfq_v2_read_grant(&grant)?;
+        }
 
         // Renew the dead-man switch every round. If this process stops, the
         // server withdraws every open quote once the deadline passes.

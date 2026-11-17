@@ -940,6 +940,83 @@ outcome is ambiguous, the error includes the selected nonce and canonical
 request fields. Reconcile first. Any retry of that ambiguous request must reuse
 the original nonce and every other canonical field exactly.
 
+### Portfolio Margin loan repayment
+
+A Portfolio Margin account can repay its PM financing early from its HyperCore
+USDC. The Account.sol manager signs a `RepayPmLoan` request; API wallets and
+agents are refused. `underlying` names the loan exactly as `get_pm_financing`
+lists it, and unpaid settlement obligations are always repaid first.
+`RepayAmount::All` repays everything owed; `RepayAmount::Usdc` takes an exact
+amount with at most six decimals.
+
+```rust,no_run
+use hypercall_client::{
+    AccountAddress, HypercallClient, HypercallWallet, PmRepayRejection, RepayAmount,
+    RepayPmLoanParams,
+};
+use rust_decimal_macros::dec;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = HypercallClient::new("https://api.hypercall.xyz");
+    let manager = HypercallWallet::from_private_key("0xYOUR_MANAGER_KEY", 999)?;
+    let account: AccountAddress = "0xYOUR_ACCOUNT_SOL".parse()?;
+
+    let financing = client.get_pm_financing(account).await?;
+    if let Some(repayment) = &financing.repayment {
+        if let Some(blocked) = repayment.blocked_reason {
+            // A request now would fail with `blocked.rejection()`.
+            println!("repayment blocked: {blocked:?}");
+            return Ok(());
+        }
+        println!(
+            "repayable now: {:?} USDC",
+            repayment.unreserved_withdrawable_usdc
+        );
+    }
+
+    let result = client
+        .repay_pm_loan(
+            &manager,
+            RepayPmLoanParams {
+                account,
+                underlying: "BTC".to_string(),
+                amount: RepayAmount::Usdc(dec!(250)),
+                nonce: None,
+            },
+        )
+        .await;
+    match result {
+        Ok(accepted) => println!("repayment plan: {}", accepted.plan_id),
+        Err(error) => match PmRepayRejection::from_error(&error) {
+            Some(PmRepayRejection::InsufficientWithdrawable) => {
+                println!("not enough unreserved HyperCore USDC")
+            }
+            Some(rejection) => println!("refused: {}", rejection.code()),
+            None => return Err(error.into()),
+        },
+    }
+    Ok(())
+}
+```
+
+Acceptance reserves the USDC; the repayment lands once HyperCore confirms the
+transfer. Poll `get_pm_financing` and follow `repayment.requests` by `plan_id`
+until `status.is_terminal()`: `Repaid`, `Canceled` (nothing moved, sign a new
+request) or `EscalatedManual`. An exact retry (same account, underlying,
+amount and nonce) returns the original request, so pass `nonce` explicitly
+when you may need to retry.
+
+Rejections are `ClientError::Api` errors. `PmRepayRejection::from_error` reads
+their stable code: the `pm_voluntary_repayment_*` codes, for example
+`InsufficientWithdrawable` or `RecoveryInProgress` (409) and `BelowMinimum`
+(400), plus `NotManager` (403, the signer is not the Account.sol manager),
+`InvalidNonce` and `SignatureVerificationFailed`. `repayment.blocked_reason`
+(`RecoveryInProgress` or `AccountUnhealthy`) predicts the matching rejection
+through `PmRepaymentBlockedReason::rejection`, so a client can grey out the
+action before signing. A server without voluntary repayment leaves
+`repayment` as `None`.
+
 ## Development
 
 Run the focused client checks before changing this crate:
@@ -979,7 +1056,7 @@ The `rfq-v2` feature is on by default since 0.3.0. It also enables `rfq-v2` on
 
 ```toml
 [dependencies]
-hypercall-client = { git = "https://github.com/hypercall-public/hypercall-rust", tag = "v0.4.0", default-features = false, features = ["alloy-rustls", "rfq-v2"] }
+hypercall-client = { git = "https://github.com/hypercall-public/hypercall-rust", tag = "v0.5.0", default-features = false, features = ["alloy-rustls", "rfq-v2"] }
 ```
 
 | Module | What it does |

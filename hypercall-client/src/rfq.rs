@@ -229,6 +229,7 @@ mod tests {
                 instrument: inst.to_string(),
                 side: side.to_string(),
                 size: size.to_string(),
+                physical: None,
             })
             .collect()
     }

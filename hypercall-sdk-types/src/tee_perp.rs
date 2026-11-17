@@ -489,7 +489,10 @@ impl PerpRejectionReasonCode {
     }
 }
 
-fn serialize_optional_safe_u64<S>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error>
+pub(crate) fn serialize_optional_safe_u64<S>(
+    value: &Option<u64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -499,7 +502,7 @@ where
     }
 }
 
-fn deserialize_optional_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+pub(crate) fn deserialize_optional_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
 where
     D: Deserializer<'de>,
 {

@@ -1,11 +1,13 @@
 pub mod api_models;
 pub mod directives;
 pub mod enums;
+mod fill_api;
 pub mod requests;
 pub mod responses;
 #[cfg(feature = "rfq-v2")]
 pub mod rfq_v2;
 pub mod tee_perp;
+pub mod tee_spot;
 pub mod wallet_address;
 pub mod ws_protocol;
 
@@ -78,6 +80,10 @@ pub use tee_perp::{
     TeePerpTwapCancelSubmitRequest, TeePerpTwapResponse, TeePerpTwapSubmitRequest,
     DEFAULT_TEE_PERP_BATCH_MODIFY_MAX_CHILDREN, MAX_TEE_PERP_BATCH_MODIFY_CHILDREN,
     TEE_PERP_TWAP_MAX_MINUTES, TEE_PERP_TWAP_MIN_MINUTES,
+};
+pub use tee_spot::{
+    TeeSpotCancelAction, TeeSpotOrderAction, TeeSpotResponse, TEE_SPOT_ASSET_OFFSET,
+    TEE_SPOT_CANCEL_SUBMIT_ROUTE, TEE_SPOT_ORDER_SUBMIT_ROUTE,
 };
 pub use wallet_address::WalletAddress;
 pub use ws_protocol::*;
