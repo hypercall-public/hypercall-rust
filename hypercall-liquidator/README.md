@@ -31,8 +31,7 @@ Standard-margin full liquidation auctions publish an `auction_version` in
 The liquidator bids the published bid from a fresh status read, signs it with
 the published valuation timestamp, and checks its own terms hash against
 `current_auction_terms_hash` before signing. It refuses any other auction
-version. Version 0.4.0 hashed the bid for version 2 auctions and every such
-bid failed settlement; use 0.5.0 or later.
+version.
 
 ## Getting Started
 
