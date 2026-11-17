@@ -5,6 +5,7 @@
 //! an account can be liquidated. Hyperliquid orders only manage the operator's
 //! risk after a liquidation is chosen.
 
+pub mod auction;
 pub mod config;
 pub mod cycle;
 pub mod hedge;
@@ -14,6 +15,10 @@ pub mod reader;
 pub mod types;
 pub mod ui;
 
+pub use auction::{
+    auction_terms_hash, verify_published_terms_hash, AuctionBidRule, AuctionTermsError,
+    SUPPORTED_AUCTION_VERSIONS,
+};
 pub use config::{ConfigError, HypercallLiquidatorConfig, KeyConfig, KeyKind};
 pub use cycle::{
     discover_standard_margin_liquidation_cycles, execute_hedge_after_liquidation,

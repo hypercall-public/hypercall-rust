@@ -222,7 +222,6 @@ fn authorized_parent_views_redact_private_taker_fields() {
             target: 5_000_000,
             fill_policy: RfqV2FillPolicy::FullSizeOnce,
             execution_mode: RfqV2ExecutionMode::Manual,
-            auto_execution_limit: None,
             quote_policy: RfqV2QuotePolicy::FirmOnly,
             taker_identity: RfqV2TakerIdentity::Anonymous,
             quote_deadline_ms: 1_900_000_020_000,

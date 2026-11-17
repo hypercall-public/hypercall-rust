@@ -12,8 +12,8 @@ pub use client::{ClientControlMessage, GatewayErrorCode, GatewayStatus, GatewayS
 pub use qp::{
     BorrowedIndicativeQuote, BorrowedIndicativeQuoteUpdate, BorrowedScopedIndicativeQuoteUpdate,
     GatewayResumeQuoteProvider, IndicativeQuote, QpClientMessage, QpInboundMessage,
-    QpOutboundMessage, QpResponseLeg, QpRfqLeg, QpServerMessage, ScopeId, ScopeIdParseError,
-    CAP_SCOPED_INDICATIVE,
+    QpOutboundMessage, QpPhysicalLeg, QpResponseLeg, QpRfqLeg, QpServerMessage, ScopeId,
+    ScopeIdParseError, CAP_SCOPED_INDICATIVE,
 };
 pub use recovery::{
     WsCloseError, WsDeliveryClass, WsPressureCause, WsRecoveryAction, WsSlowConsumerCloseReason,

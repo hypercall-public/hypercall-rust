@@ -297,11 +297,37 @@ pub struct QpResponseLeg {
 }
 
 /// A leg in an RFQ request sent to QPs.
+///
+/// The legs hash a quote signs covers `instrument`, `side` and `size` only;
+/// `physical` is informational and never part of the signed payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QpRfqLeg {
     pub instrument: String,
     pub side: String,
     pub size: String,
+    /// Delivery terms of a physically settled call series. Absent (and
+    /// omitted from the wire) for every cash-settled leg, so a cash RFQ is
+    /// byte-identical to one from a server that predates this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical: Option<QpPhysicalLeg>,
+}
+
+/// How a physically settled call leg settles: priced, margined and expired
+/// on `settles_as` (with the same settlement price as its cash calls), and
+/// delivering `deliver_token` on HyperCore at expiry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QpPhysicalLeg {
+    /// The cash underlying the series is priced, margined and expired on,
+    /// e.g. `"BTC"` for a `UBTC` series.
+    pub settles_as: String,
+    /// HyperCore spot token index delivered at expiry, one token unit per
+    /// contract. A writer escrows it at the fill.
+    pub deliver_token: u32,
+    /// The ticker of `deliver_token`, e.g. `"UBTC"`.
+    pub deliver_token_symbol: String,
+    /// Basis add-on on a net long position, as a decimal fraction of
+    /// `spot x contracts` charged on initial and maintenance margin.
+    pub basis: String,
 }
 
 #[cfg(test)]

@@ -723,6 +723,18 @@ pub struct InstrumentSpecResponse {
     pub option_kind: Option<String>,
     /// Delivery mode, e.g. `"CASH"` or `"PHYSICAL"`.
     pub delivery: Option<String>,
+    /// Physical series only: the cash underlying the series is priced,
+    /// margined and expired on (e.g. `"BTC"` for a `UBTC` series).
+    /// `base_asset` stays the series' own underlying, its routing key.
+    #[serde(default)]
+    pub settles_as: Option<String>,
+    /// Physical series only: the HyperCore spot token index delivered at
+    /// expiry.
+    #[serde(default)]
+    pub deliver_token: Option<u32>,
+    /// Physical series only: the ticker of `deliver_token`.
+    #[serde(default)]
+    pub deliver_token_symbol: Option<String>,
     /// Settlement asset for margin and PnL accounting.
     pub settle_asset: Option<String>,
     /// Base asset for cross-venue mapping.
@@ -736,7 +748,8 @@ pub struct InstrumentSpecResponse {
     /// UTC hour of day at which this instrument expires and settles.
     pub settlement_hour_utc: Option<u8>,
     /// UTC time of day ("HH:MM") at which this instrument expires and
-    /// settles. Authoritative alongside expiry_ns; per-underlying policy.
+    /// settles. Derived from this instrument's own expiry_ns, so one
+    /// underlying can list different times across daylight saving changes.
     pub settlement_time_utc: Option<String>,
     /// Contract size used for Greeks and notional scaling.
     pub contract_size: f64,
@@ -754,6 +767,10 @@ pub struct InstrumentSpecResponse {
     pub state: String,
     /// Whether the instrument can currently accept new trading activity.
     pub is_tradable: bool,
+    /// Whether the instrument is open for RFQ trading. Same value as `rfq`
+    /// on `GET /instruments`.
+    #[serde(default)]
+    pub rfq: bool,
     /// First-listed time in nanoseconds, if known.
     pub listed_time_ns: Option<i64>,
     /// Timestamp for this spec version in nanoseconds. Currently always

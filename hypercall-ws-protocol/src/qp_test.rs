@@ -1,6 +1,6 @@
 use super::{
     BorrowedIndicativeQuoteUpdate, BorrowedScopedIndicativeQuoteUpdate, IndicativeQuote,
-    QpClientMessage, QpRfqLeg, QpServerMessage, ScopeId, CAP_SCOPED_INDICATIVE,
+    QpClientMessage, QpPhysicalLeg, QpRfqLeg, QpServerMessage, ScopeId, CAP_SCOPED_INDICATIVE,
 };
 use std::borrow::Cow;
 
@@ -74,6 +74,7 @@ fn rfq_request_serializes_auto_accept_limit_when_present() {
             instrument: "BTC-20260501-90000-C".to_string(),
             side: "buy".to_string(),
             size: "1".to_string(),
+            physical: None,
         }],
         taker_wallet: "0x123".to_string(),
         request_timestamp: 1,
@@ -250,4 +251,47 @@ fn authenticated_empty_capabilities_omitted_on_wire() {
         serde_json::to_string(&msg).unwrap(),
         r#"{"type":"authenticated","wallet":"0x123"}"#
     );
+}
+
+#[test]
+fn a_cash_rfq_leg_omits_physical_terms_on_the_wire() {
+    let leg = QpRfqLeg {
+        instrument: "BTC-20260501-90000-C".to_string(),
+        side: "buy".to_string(),
+        size: "1".to_string(),
+        physical: None,
+    };
+    assert_eq!(
+        serde_json::to_string(&leg).unwrap(),
+        r#"{"instrument":"BTC-20260501-90000-C","side":"buy","size":"1"}"#
+    );
+}
+
+#[test]
+fn a_physical_rfq_leg_carries_its_delivery_terms() {
+    let leg = QpRfqLeg {
+        instrument: "UBTC-20260501-90000-C".to_string(),
+        side: "sell".to_string(),
+        size: "0.5".to_string(),
+        physical: Some(QpPhysicalLeg {
+            settles_as: "BTC".to_string(),
+            deliver_token: 197,
+            deliver_token_symbol: "UBTC".to_string(),
+            basis: "0.02".to_string(),
+        }),
+    };
+    let json = serde_json::to_string(&leg).unwrap();
+    assert_eq!(
+        json,
+        r#"{"instrument":"UBTC-20260501-90000-C","side":"sell","size":"0.5","physical":{"settles_as":"BTC","deliver_token":197,"deliver_token_symbol":"UBTC","basis":"0.02"}}"#
+    );
+    assert_eq!(serde_json::from_str::<QpRfqLeg>(&json).unwrap(), leg);
+}
+
+#[test]
+fn an_rfq_leg_from_an_older_server_decodes_without_physical_terms() {
+    let leg: QpRfqLeg =
+        serde_json::from_str(r#"{"instrument":"UBTC-20260501-90000-C","side":"buy","size":"1"}"#)
+            .unwrap();
+    assert_eq!(leg.physical, None);
 }

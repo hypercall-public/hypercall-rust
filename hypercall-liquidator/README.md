@@ -18,6 +18,22 @@ from current authoritative responses. Do not infer that field from NAV or fill
 it with zero. Update Rust struct literals before upgrading the crate. See the
 [API migration guide](https://docs.hypercall.xyz/docs/trading/over-api/operations/changelog#no-new-release---september-2-2026).
 
+## Auction versions
+
+Standard-margin full liquidation auctions publish an `auction_version` in
+`GET /liquidation/status` (`full_liquidation.current_auction_version`):
+
+| version | bid rule | terms hash |
+| --- | --- | --- |
+| 1 | The bid must equal `current_required_bid_usdc`. | Includes the bid. |
+| 2 | The bid must be at or above `current_required_bid_usdc`, the minimum at `current_valuation_timestamp_ms`. The minimum starts at positive equity and falls to a floor over the auction. | Leaves the bid out. |
+
+The liquidator bids the published bid from a fresh status read, signs it with
+the published valuation timestamp, and checks its own terms hash against
+`current_auction_terms_hash` before signing. It refuses any other auction
+version. Version 0.4.0 hashed the bid for version 2 auctions and every such
+bid failed settlement; use 0.5.0 or later.
+
 ## Getting Started
 
 Clone the public repository and validate the example config:

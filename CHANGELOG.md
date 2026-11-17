@@ -1,6 +1,233 @@
 # Changelog
 
-## 0.4.0 (unreleased)
+## 0.5.0 (unreleased)
+
+`hypercall-ws-protocol`, `hypercall-sdk-types`, `hypercall-client`,
+`hypercall-hyperliquid` and `hypercall-liquidator` all move to `0.5.0`
+together. Each pins the others at `0.5.0`, so a build resolves one copy of
+every Hypercall crate. `hypercall-covered-call-maker-sdk` stays at `0.1.0` and
+depends on none of them.
+
+Publish order: `hypercall-ws-protocol`, `hypercall-sdk-types`,
+`hypercall-client`, `hypercall-hyperliquid`, `hypercall-liquidator`.
+
+### Breaking: `hypercall-ws-protocol`
+
+- [`QpRfqLeg`](https://docs.rs/hypercall-ws-protocol/0.5.0/hypercall_ws_protocol/qp/struct.QpRfqLeg.html) gains [`physical: Option<QpPhysicalLeg>`](https://docs.rs/hypercall-ws-protocol/0.5.0/hypercall_ws_protocol/qp/struct.QpPhysicalLeg.html). A quote provider's
+  `rfq_request` now marks each leg on a physically settled call series with
+  its `settles_as` base, `deliver_token`, `deliver_token_symbol` and margin
+  `basis`. Cash legs omit the field, so cash RFQs keep their exact wire bytes,
+  and the legs hash a quote signs is unchanged (`instrument|side|size`). Code
+  that builds `QpRfqLeg` with a literal must set `physical`.
+
+### Breaking: `hypercall-sdk-types`
+
+- [`Portfolio`](https://docs.rs/hypercall-sdk-types/0.5.0/hypercall_sdk_types/api_models/struct.Portfolio.html) gains `spot_available_usdc: Option<Decimal>`, the free USDC
+  under the spot-buy cash check after financing and reservations. It is
+  `None` for standard margin accounts and when the cash facts are
+  unavailable; it is not an order approval.
+- [`WsMessage::MarginUpdate`](https://docs.rs/hypercall-sdk-types/0.5.0/hypercall_sdk_types/ws_protocol/enum.WsMessage.html#variant.MarginUpdate) gains `spot_available_usdc` with the same
+  meaning, and its `margin_summary` field is now `Box<MarginSummary>`.
+  Matches that bind `margin_summary` by value see a `Box`.
+- [`InstrumentSpecResponse`](https://docs.rs/hypercall-sdk-types/0.5.0/hypercall_sdk_types/responses/struct.InstrumentSpecResponse.html) gains `settles_as`, `deliver_token` and
+  `deliver_token_symbol`, set only for physically settled series. All three
+  default to `None` when absent from the JSON. `settlement_time_utc` is now
+  derived from each instrument's own expiry, so one underlying can list
+  different UTC times across daylight saving changes.
+- Code that builds these structs or variants with literals must set the new
+  fields.
+
+### Breaking: RFQ V2 (`hypercall-sdk-types`, `rfq-v2` feature)
+
+- [`RfqV2MakerTerms`](https://docs.rs/hypercall-sdk-types/0.5.0/hypercall_sdk_types/rfq_v2/struct.RfqV2MakerTerms.html) no longer has
+  `auto_execution_limit`. The taker's limit is private: a maker learns only
+  whether execution is automatic. Quotes bind the parent through
+  `terms_commitment`, so maker signing is unchanged. Code that reads or builds
+  the field must drop it. The taker view (`RfqV2Terms`) keeps it.
+- [`WsFillUpdate`](https://docs.rs/hypercall-sdk-types/0.5.0/hypercall_sdk_types/ws_protocol/struct.WsFillUpdate.html) and
+  [`FillApiResponse`](https://docs.rs/hypercall-sdk-types/0.5.0/hypercall_sdk_types/api_models/struct.FillApiResponse.html) gain
+  `rfq_id`, `quote_id` and `execution_id` (all `Option<Uuid>`). Literals must
+  set them. They are omitted from JSON when absent, so order-book and v1 RFQ
+  fills keep their wire bytes.
+- [`RfqV2OperationResponse`](https://docs.rs/hypercall-sdk-types/0.5.0/hypercall_sdk_types/rfq_v2/struct.RfqV2OperationResponse.html)
+  gains `maker_generation`, `rfq_generation` and `results`, all optional and
+  omitted when absent. Literals must set them.
+
+### Added: RFQ V2 maker API
+
+- **Fill attribution.** Every RFQ V2 leg fill, maker and taker side, carries
+  the RFQ, firm quote and execution that produced it, on the `fills`
+  WebSocket message and on `GET /fills`. `execution_id` matches the
+  executions cursor below.
+- **Executions cursor.**
+  [`HypercallClient::list_rfq_v2_executions`](https://docs.rs/hypercall-client/0.5.0/hypercall_client/struct.HypercallClient.html#method.list_rfq_v2_executions)
+  reads `GET /private/rfqs/executions`: committed executions where the signed
+  account is maker or taker, ascending by a durable `sequence`. Save
+  `next_after_sequence` and resume from it. Every execution appears exactly
+  once in cursor order. Types: `ListRfqV2ExecutionsQuery`,
+  `ListRfqV2ExecutionsResponse`, `RfqV2AccountExecution`,
+  `RfqV2AccountExecutionLeg` and `RfqV2ExecutionRole`.
+- **Provider read.**
+  [`HypercallClient::get_rfq_v2_provider`](https://docs.rs/hypercall-client/0.5.0/hypercall_client/struct.HypercallClient.html#method.get_rfq_v2_provider)
+  reads `GET /private/rfq-provider`, the signed account's own quote-provider
+  enrollment: `RfqV2ProviderResponse` with `enrolled`, `provider`, `status`,
+  `tier`, `allowed_underlyings` and `receives_open_rfqs`. It carries no
+  notional caps.
+- **Bulk withdrawal results.** A quote-ID bulk withdrawal is best effort: it
+  withdraws every live quote, skips ones that can no longer execute, and
+  reports each ID in `results`
+  ([`RfqV2BulkWithdrawalTargetResult`](https://docs.rs/hypercall-sdk-types/0.5.0/hypercall_sdk_types/rfq_v2/struct.RfqV2BulkWithdrawalTargetResult.html),
+  status `withdrawn`, `already_inactive`, `not_found`, `not_permitted` or
+  `unauthorized`). `rfq` and `all_open` withdrawals return `maker_generation`
+  and `rfq_generation` read after the commit.
+- [`InstrumentSpecResponse`](https://docs.rs/hypercall-sdk-types/0.5.0/hypercall_sdk_types/responses/struct.InstrumentSpecResponse.html)
+  gains `rfq: bool` (defaults to `false` when absent), the same trading-mode
+  flag as `GET /instruments`.
+- The full `rfq_v2` view (`RfqV2Rfq`) and the `rfq_v2_grant_expired` socket
+  error are under "Added: RFQ V2 full maker view on `rfq_v2`" below.
+- **`WsClient` full view.** `WsClient::subscribe_rfq_v2_with_view(RfqV2View::Full)`
+  subscribes with the full view and keeps it across reconnects.
+  `rfq_v2_recovery::rfq_v2_full_read` decodes an `RfqV2Rfq` frame from
+  `WsClient` messages, as `rfq_v2_change_hint` does for hints.
+- **`WsClient` grant renewal.** `WsClient::reauthenticate_rfq_v2` sends a
+  fresh read grant for the same account on the live connection. The
+  subscriptions stay, and later reconnects use the new grant.
+
+### Changed: `WsClient` keeps an RFQ V2 session past grant expiry
+
+- A `connect_rfq_v2` session no longer closes itself when its read grant's
+  `expires_at_ms` passes. The server keeps the connection and sends one
+  `Error` with `code` `rfq_v2_grant_expired`, which now reaches the caller
+  like any other message. Answer it, or renew ahead of expiry, with
+  `WsClient::reauthenticate_rfq_v2`. A reconnect while the current grant is
+  expired still ends the session.
+
+### Changed: RFQ V2 server rules the SDK surfaces
+
+- Firm quote publication refuses a quote nonce outside the engine time window
+  with `400 rfq_v2_quote_nonce_rejected`. Sign firm quotes with a current
+  millisecond nonce, which the client's nonce providers already do.
+- RFQ creation consumes the parent's nonce in its own nonce set and refuses a
+  nonce outside the window, or an `expires_at_ms` more than 2 days after it,
+  with `400 rfq_v2_nonce_out_of_window`. Counter-style nonces no longer work
+  for RFQ creation.
+- Read grants are accepted with `issued_at_ms` up to 30 s ahead of the
+  server clock. Lifetime is capped from both the issue time and the server
+  clock.
+- Routing skips makers that share a principal with the taker, and firm quote
+  publication refuses a self-trade with `rfq_v2_self_trade`.
+  `selected_makers` routes to its eligible subset; an empty subset gets
+  `rfq_v2_no_eligible_makers`.
+
+### Added: TEE spot orders
+
+- `hypercall-sdk-types`: new [`tee_spot`](https://docs.rs/hypercall-sdk-types/0.5.0/hypercall_sdk_types/tee_spot/index.html) module with [`TeeSpotOrderAction`](https://docs.rs/hypercall-sdk-types/0.5.0/hypercall_sdk_types/tee_spot/struct.TeeSpotOrderAction.html),
+  [`TeeSpotCancelAction`](https://docs.rs/hypercall-sdk-types/0.5.0/hypercall_sdk_types/tee_spot/struct.TeeSpotCancelAction.html), [`TeeSpotResponse`](https://docs.rs/hypercall-sdk-types/0.5.0/hypercall_sdk_types/tee_spot/struct.TeeSpotResponse.html), [`TEE_SPOT_ASSET_OFFSET`](https://docs.rs/hypercall-sdk-types/0.5.0/hypercall_sdk_types/tee_spot/constant.TEE_SPOT_ASSET_OFFSET.html) and the
+  [`TEE_SPOT_ORDER_SUBMIT_ROUTE`](https://docs.rs/hypercall-sdk-types/0.5.0/hypercall_sdk_types/tee_spot/constant.TEE_SPOT_ORDER_SUBMIT_ROUTE.html) / [`TEE_SPOT_CANCEL_SUBMIT_ROUTE`](https://docs.rs/hypercall-sdk-types/0.5.0/hypercall_sdk_types/tee_spot/constant.TEE_SPOT_CANCEL_SUBMIT_ROUTE.html) constants.
+- `hypercall-client`: new [`tee_spot`](https://docs.rs/hypercall-client/0.5.0/hypercall_client/tee_spot/index.html) module. [`TeeSpotSigner`](https://docs.rs/hypercall-client/0.5.0/hypercall_client/tee_spot/trait.TeeSpotSigner.html),
+  [`TeeSpotOrderParams`](https://docs.rs/hypercall-client/0.5.0/hypercall_client/tee_spot/struct.TeeSpotOrderParams.html), [`TeeSpotCancelParams`](https://docs.rs/hypercall-client/0.5.0/hypercall_client/tee_spot/struct.TeeSpotCancelParams.html), the EIP-712 payloads
+  [`TeeSpotOrderSignature`](https://docs.rs/hypercall-client/0.5.0/hypercall_client/tee_spot/struct.TeeSpotOrderSignature.html) and [`TeeSpotCancelSignature`](https://docs.rs/hypercall-client/0.5.0/hypercall_client/tee_spot/struct.TeeSpotCancelSignature.html), and
+  [`tee_spot_order_signing_hash`](https://docs.rs/hypercall-client/0.5.0/hypercall_client/tee_spot/fn.tee_spot_order_signing_hash.html) / [`tee_spot_cancel_signing_hash`](https://docs.rs/hypercall-client/0.5.0/hypercall_client/tee_spot/fn.tee_spot_cancel_signing_hash.html).
+- `hypercall-hyperliquid`: [`PreparedHyperliquidAction::prepare_user_spot_order`](https://docs.rs/hypercall-hyperliquid/0.5.0/hypercall_hyperliquid/struct.PreparedHyperliquidAction.html#method.prepare_user_spot_order)
+  prepares one exact user spot order for the TEE rail, carrying the Hypercall
+  builder at zero fee like every TEE perp order, and
+  [`PreparedHyperliquidAction::user_spot_order`](https://docs.rs/hypercall-hyperliquid/0.5.0/hypercall_hyperliquid/struct.PreparedHyperliquidAction.html#method.user_spot_order) reads it back.
+
+### Added: managed vaults
+
+- `hypercall-client`: new [`vaults`](https://docs.rs/hypercall-client/0.5.0/hypercall_client/vaults/index.html) module. `HypercallClient` can list, read,
+  create, deposit to, withdraw from, close and cancel requests on managed
+  vaults, and read holders, settlements, history and status changes. Types:
+  [`Vault`](https://docs.rs/hypercall-client/0.5.0/hypercall_client/vaults/struct.Vault.html), `VaultConfigParams`, `VaultMetadata`, `VaultHolder`,
+  `VaultQueuedRequest`, `VaultSettlement`, `VaultSettlementsPage`,
+  `VaultFill`, `VaultHistoryPage`, `VaultStatusChange`,
+  `VaultStatusChangesPage`, `VaultPage`, `CreateVaultResponse` and
+  `VaultRequestResponse`.
+- The paged reads (`get_vault_settlements`, `get_vault_history`,
+  `get_vault_status_changes`) all take a `VaultPage`. For status changes,
+  `before_seq` is the previous page's `next_before`.
+
+### Changed: `hypercall-hyperliquid`
+
+- Requires `hypercall-client` 0.5 for its optional `hypercall-client`
+  feature. It moves to 0.5.0 so it never pulls a second client version.
+
+### Added: version 2 standard-margin auction support in `hypercall-liquidator`
+
+Standard-margin full liquidation auctions can publish `auction_version` 2: the
+minimum bid starts at the account's positive equity and falls linearly to a
+floor (75% over 30 minutes by default), and any bid at or above the minimum
+settles. A version 2 terms hash leaves the bid out. `hypercall-liquidator` now
+bids on version 2 auctions; version 1 hashes and bids are unchanged.
+
+- The terms hash follows the published `auction_version`: version 1 includes
+  the bid, version 2 leaves it out. Any other version is refused with
+  `AuctionTermsError::UnsupportedVersion` instead of being hashed as a known
+  one.
+- The locally computed terms hash is compared with the published
+  `current_auction_terms_hash`. A mismatch stops the cycle with
+  `AuctionTermsError::TermsHashMismatch` before a bid is signed, so a future
+  encoding change fails loudly instead of as a rejected bid.
+- Before signing, the bid is checked against the published bid for its
+  valuation timestamp: exact for version 1, at or above the minimum for
+  version 2. The liquidator bids the published minimum from a fresh status
+  read, so it follows the floor down as the auction ages and never bids below
+  it.
+- New public `auction` module: `AuctionBidRule`, `auction_terms_hash`,
+  `verify_published_terms_hash`, `AuctionTermsError` and
+  `SUPPORTED_AUCTION_VERSIONS`.
+
+### Breaking: `hypercall-liquidator`
+
+- `CycleError` gains the `AuctionTerms` variant. Exhaustive matches on
+  `CycleError` need a new arm.
+
+### Added: Portfolio Margin loan repayment
+
+- `HypercallClient::repay_pm_loan` repays an account's PM financing from its
+  HyperCore USDC through `POST /v1/pm-financing/repay`. The Account.sol
+  manager signs the new `RepayPmLoan` EIP-712 type
+  (`RepayPmLoan(address wallet,address account,string underlying,string amount,uint64 nonce)`,
+  Hypercall domain). `RepayAmount::Usdc` takes an exact amount with at most
+  six decimals and signs its normalized string; `RepayAmount::All` signs `all`.
+- `HypercallWallet::sign_repay_pm_loan` signs the action for callers that
+  build the request themselves.
+- `HypercallClient::get_pm_financing` reads `GET /v1/pm-financing`: loans,
+  unpaid settlement obligations, totals, margin, and the new optional
+  `repayment` status (unreserved withdrawable USDC, the reason a request
+  would be refused now, and the latest requests). `repayment` is `None` from
+  servers that predate voluntary repayment.
+- `PmRepaymentStatus` types each request's status (`is_terminal` for
+  `Repaid`, `Canceled` and `EscalatedManual`), and `PmRepaymentBlockedReason`
+  types `blocked_reason`. Both read unknown future values as `Unknown`.
+- `PmRepayRejection::from_error` maps a failed repayment to its stable server
+  code (`pm_voluntary_repayment_*`, `forbidden`, `invalid_nonce`,
+  `signature_verification_failed`), and
+  `PmRepaymentBlockedReason::rejection` names the rejection a blocked request
+  would get.
+
+### Added: RFQ V2 full maker view on `rfq_v2`
+
+- `WsMessage::Subscribe` has a new optional `view: Option<RfqV2View>`
+  (`hint`, the default, or `full`). Code that builds `Subscribe` with a struct
+  literal must add `view: None`.
+- `WsMessage::RfqV2Rfq(WsRfqV2Rfq)` (`rfq-v2` feature) carries a change's
+  `sequence` and the authenticated account's `RfqV2Response`, exactly the
+  `GET /private/rfqs/{rfq_id}` body. A `full` subscription receives it instead
+  of `RfqV2Changed`, and still receives `RfqV2Changed` for any change whose
+  read the server could not build.
+- An `rfq_v2` subscriber whose read grant lapsed receives one `Error` with
+  `code` `rfq_v2_grant_expired` and `channel` `rfq_v2` when a change for it is
+  withheld. Send `AuthenticateRfqV2` with a fresh grant to resume; the
+  subscription stays.
+
+### Breaking: `hypercall-client` drops `get_username`
+
+- `HypercallClient::get_username` and `UsernameLookupResponse` are removed.
+  The Analytics API owns usernames: read them from its `GET /username`
+  directly. The Hypercall API's `/username` route is a deprecated proxy to it.
+
+## 0.4.0 (2026-10-21)
 
 All five public crates move to `0.4.0` together. This is a security release.
 

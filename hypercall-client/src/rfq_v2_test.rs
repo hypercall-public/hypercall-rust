@@ -39,7 +39,7 @@ fn signature() -> RfqV2Signature {
 #[tokio::test]
 async fn wallet_signs_reusable_private_read_grant_for_bearer_header() {
     let wallet = crate::HypercallWallet::from_private_key(
-        "0x59c6995e998f97a5a0044966f094538e5b2f9f8c9360f0c2b3b8a4e1f2f8f96d",
+        "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
         998,
     )
     .unwrap();
@@ -367,6 +367,33 @@ async fn scheduled_quote_cancel_client_posts_signed_deadline() {
     let raw = task.await.unwrap();
     assert!(raw.starts_with("POST /private/rfq-quote-cancel-schedule "));
     assert!(raw.contains("\"cancel_at_ms\":1900000030000"));
+}
+
+#[tokio::test]
+async fn provider_read_gets_the_signed_accounts_enrollment() {
+    let response = serde_json::json!({
+        "account": test_wallet(1),
+        "enrolled": false,
+        "provider": null,
+        "status": null,
+        "tier": null,
+        "allowed_underlyings": null,
+        "receives_open_rfqs": false
+    });
+    let (base_url, task) = serve_once_with_status("200 OK", response.to_string()).await;
+    let provider = HypercallClient::new(base_url)
+        .get_rfq_v2_provider(RfqV2ReadCredentials {
+            bearer_token: "test-session",
+        })
+        .await
+        .unwrap();
+    assert!(!provider.enrolled);
+    assert!(!provider.receives_open_rfqs);
+    let raw = task.await.unwrap();
+    assert!(raw.starts_with("GET /private/rfq-provider "), "{raw}");
+    assert!(raw
+        .to_ascii_lowercase()
+        .contains("authorization: bearer test-session"));
 }
 
 fn id(value: &str) -> Uuid {
@@ -1504,4 +1531,56 @@ async fn change_watcher_retries_a_truncated_5xx_and_stops_on_a_truncated_401() {
         .unwrap()
         .is_none());
     task.await.unwrap();
+}
+
+#[tokio::test]
+async fn execution_cursor_reads_with_the_bearer_grant_and_query_cursor() {
+    let response = json!({
+        "executions": [{
+            "sequence": 42,
+            "execution_id": "6c8a37a4-5dbd-4b8a-9d55-8f0a3c2b9e11",
+            "rfq_id": "f7c1ee82-c235-4bef-bc4b-af719f73d3ce",
+            "quote_id": "6889f9c6-cc85-40d9-86bb-df012ea74e2a",
+            "role": "maker",
+            "maker_account": "0x0000000000000000000000000000000000000002",
+            "package_units": "1000000",
+            "fee_micros": "0",
+            "executed_at_ms": 1_900_000_000_000_u64,
+            "legs": [{
+                "instrument": "BTC-20261226-100000-C",
+                "side": "sell",
+                "quantity_micros": "1000000",
+                "price_micros": "1250000000"
+            }]
+        }],
+        "next_after_sequence": 42,
+        "has_more": false
+    });
+    let (base_url, task) = serve_once_with_status("200 OK", response.to_string()).await;
+    let client = HypercallClient::new(base_url);
+    let page = client
+        .list_rfq_v2_executions(
+            &ListRfqV2ExecutionsQuery {
+                after_sequence: Some(41),
+                limit: Some(500),
+            },
+            RfqV2ReadCredentials {
+                bearer_token: "test-session",
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.next_after_sequence, 42);
+    let execution = &page.executions[0];
+    assert_eq!(execution.role, RfqV2ExecutionRole::Maker);
+    assert_eq!(execution.legs[0].side, RfqV2Side::Sell);
+    assert_eq!(execution.legs[0].price_micros, 1_250_000_000);
+    let raw = task.await.unwrap();
+    assert!(
+        raw.starts_with("GET /private/rfqs/executions?after_sequence=41&limit=500 "),
+        "{raw}"
+    );
+    assert!(raw
+        .to_ascii_lowercase()
+        .contains("authorization: bearer test-session"));
 }

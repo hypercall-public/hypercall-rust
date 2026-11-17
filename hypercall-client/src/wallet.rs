@@ -415,7 +415,7 @@ sol! {
     }
 }
 
-fn hypercall_domain(chain_id: u32) -> Eip712Domain {
+pub(crate) fn hypercall_domain(chain_id: u32) -> Eip712Domain {
     Eip712Domain {
         name: Some("Hypercall".into()),
         version: Some("1".into()),
@@ -1341,15 +1341,22 @@ impl HypercallWallet {
             marginMode: margin_mode.to_string(),
             nonce,
         };
+        self.sign_hypercall_action(&message, "SetMarginMode").await
+    }
 
-        let domain = self.hypercall_domain();
+    /// Sign `message` under the Hypercall EIP-712 domain. `action` names the
+    /// type in signing errors.
+    pub(crate) async fn sign_hypercall_action<T: SolStruct + Send + Sync>(
+        &self,
+        message: &T,
+        action: &str,
+    ) -> Result<String> {
         let signature = self
             .signer
-            .sign_typed_data(&message, &domain)
+            .sign_typed_data(message, &self.hypercall_domain())
             .await
-            .map_err(|error| ClientError::signing("Failed to sign SetMarginMode", error))?;
-
-        Ok(format!("{}", signature))
+            .map_err(|error| ClientError::signing(format!("Failed to sign {action}"), error))?;
+        Ok(signature.to_string())
     }
 
     /// Sign a RedeemPoolShares action. `shares` must be the exact decimal
@@ -1360,15 +1367,8 @@ impl HypercallWallet {
             shares: shares.to_string(),
             nonce,
         };
-
-        let domain = self.hypercall_domain();
-        let signature = self
-            .signer
-            .sign_typed_data(&message, &domain)
+        self.sign_hypercall_action(&message, "RedeemPoolShares")
             .await
-            .map_err(|error| ClientError::signing("Failed to sign RedeemPoolShares", error))?;
-
-        Ok(format!("{}", signature))
     }
 
     /// Sign a CancelPoolRedemptions action over `request_ids` in the order
@@ -1383,15 +1383,8 @@ impl HypercallWallet {
             requestIds: request_ids.join(","),
             nonce,
         };
-
-        let domain = self.hypercall_domain();
-        let signature = self
-            .signer
-            .sign_typed_data(&message, &domain)
+        self.sign_hypercall_action(&message, "CancelPoolRedemptions")
             .await
-            .map_err(|error| ClientError::signing("Failed to sign CancelPoolRedemptions", error))?;
-
-        Ok(format!("{}", signature))
     }
 
     /// Sign a SubmitRFQ action.

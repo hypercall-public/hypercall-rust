@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
+    auction::{auction_terms_hash, verify_published_terms_hash, AuctionBidRule, AuctionTermsError},
     config::HypercallLiquidatorConfig,
     hedge::{
         plan_delta_hedge, submit_hedge_plan, DeltaHedgeInput, HedgePlan, HedgePlanDecision,
@@ -60,6 +61,7 @@ pub enum CycleError {
         account: String,
         field: &'static str,
     } = "liquidation status for {account} is missing current engine-priced bid terms: {field}",
+    AuctionTerms(#[from] AuctionTermsError) = "auction terms check failed: {_0}",
     SkippedCycle = "cannot execute liquidation for skipped cycle",
 }
 
@@ -380,6 +382,11 @@ pub async fn execute_standard_margin_liquidation_cycle(
         skip => return Err(CycleError::FreshAuctionNotEligible(skip)),
     }
 
+    // Bid the published bid: the exact bid for version 1, the current minimum
+    // for version 2. Never sign a bid the auction version would refuse.
+    let bid_usdc = terms.bid_usdc;
+    AuctionBidRule::for_version(terms.auction_version)?.check_bid(terms.bid_usdc, bid_usdc)?;
+
     let liquidator =
         hypercall_wallet_from_key_config(&config.keys.hypercall, config.hypercall.chain_id).await?;
     let request_id = uuid::Uuid::now_v7();
@@ -391,7 +398,7 @@ pub async fn execute_standard_margin_liquidation_cycle(
                 liquidated_wallet: liquidated_account,
                 request_id,
                 auction_id: terms.auction_id.clone(),
-                bid_usdc: terms.bid_usdc.to_string(),
+                bid_usdc: bid_usdc.to_string(),
                 positions: terms.positions,
                 portfolio_hash: terms.portfolio_hash.clone(),
                 auction_terms_hash: terms.auction_terms_hash.clone(),
@@ -407,7 +414,7 @@ pub async fn execute_standard_margin_liquidation_cycle(
         receipt: StandardMarginLiquidationReceipt {
             account: fresh_candidate.account,
             liquidator_wallet: liquidator.address.to_string(),
-            bid_usdc: terms.bid_usdc,
+            bid_usdc,
             request_id: response.request_id.clone(),
             auction_id: response.auction_id.clone(),
             response,
@@ -454,14 +461,19 @@ fn standard_margin_bid_terms_from_status(
     let valuation_timestamp_ms = full
         .current_valuation_timestamp_ms
         .ok_or_else(|| missing("current_valuation_timestamp_ms"))?;
-    let auction_terms_hash = public_standard_margin_auction_terms_hash(
+    let auction_terms_hash = auction_terms_hash(
         &auction_id,
         wallet,
         auction_version,
         &portfolio_hash,
         bid_usdc,
         valuation_timestamp_ms,
-    );
+    )?;
+    verify_published_terms_hash(
+        auction_version,
+        &auction_terms_hash,
+        full.current_auction_terms_hash.as_deref(),
+    )?;
 
     Ok(StandardMarginLiquidationBidTerms {
         auction_id,
@@ -475,34 +487,6 @@ fn standard_margin_bid_terms_from_status(
         auction_version,
         valuation_timestamp_ms,
     })
-}
-
-fn public_standard_margin_auction_terms_hash(
-    auction_id: &str,
-    liquidated_wallet: &WalletAddress,
-    auction_version: u64,
-    portfolio_hash: &str,
-    bid_usdc: Decimal,
-    valuation_timestamp_ms: u64,
-) -> String {
-    use sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    hash_str(&mut hasher, "standard-margin-liquidation-auction-terms-v5");
-    hash_str(&mut hasher, auction_id);
-    hash_str(&mut hasher, &liquidated_wallet.to_string());
-    hasher.update(auction_version.to_le_bytes());
-    hash_str(&mut hasher, portfolio_hash);
-    hash_str(&mut hasher, &bid_usdc.normalize().to_string());
-    hasher.update(valuation_timestamp_ms.to_le_bytes());
-    format!("sha256:{}", hex::encode(hasher.finalize()))
-}
-
-fn hash_str(hasher: &mut sha2::Sha256, value: &str) {
-    use sha2::Digest;
-
-    hasher.update((value.len() as u64).to_le_bytes());
-    hasher.update(value.as_bytes());
 }
 
 pub async fn execute_hedge_after_liquidation<V>(
@@ -696,19 +680,100 @@ mod tests {
     fn standard_margin_auction_terms_hash_matches_engine_vector() {
         let wallet = WalletAddress::from_str("0x0000000000000000000000000000000000000001").unwrap();
 
-        let hash = public_standard_margin_auction_terms_hash(
+        let hash = auction_terms_hash(
             "auction-1",
             &wallet,
             1,
             "portfolio-hash",
             dec!(1100.00),
             1_700_000_000_000,
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             hash,
             "sha256:500166c79edbea78bb54b448587648b3bc8246d4b3ce13951423e828d23991c8"
         );
+    }
+
+    fn full_status(
+        version: u64,
+        required_bid: Decimal,
+        published_hash: Option<&str>,
+    ) -> hypercall_sdk_types::FullLiquidationStatusData {
+        hypercall_sdk_types::FullLiquidationStatusData {
+            auction_id: Some("auction-1".to_string()),
+            request_id: None,
+            tx_hash: None,
+            started_at: Some(1),
+            chain_start_time: None,
+            margin_needed: None,
+            stop_request_id: None,
+            stop_tx_hash: None,
+            liquidated_at: None,
+            winner: None,
+            bonus: None,
+            resolution_tx_hash: None,
+            current_required_bid_usdc: Some(required_bid),
+            current_equity: Some(dec!(1000)),
+            current_mm_required: Some(dec!(1200)),
+            current_maintenance_margin: Some(dec!(-200)),
+            current_positions: Some(Vec::new()),
+            current_portfolio_hash: Some("portfolio-hash".to_string()),
+            current_auction_terms_hash: published_hash.map(str::to_string),
+            current_auction_version: Some(version),
+            current_valuation_timestamp_ms: Some(1_700_000_000_000),
+        }
+    }
+
+    const ENGINE_V2_VECTOR: &str =
+        "sha256:18433ebaed4fe3171f4273e713fe607d0406f227fe497d2ce00538da83472363";
+
+    #[test]
+    fn version_2_status_terms_match_the_published_engine_hash() {
+        let account = "0x0000000000000000000000000000000000000001";
+        let wallet = WalletAddress::from_str(account).unwrap();
+        let full = full_status(2, dec!(875), Some(ENGINE_V2_VECTOR));
+
+        let terms = standard_margin_bid_terms_from_status(account, &wallet, &full)
+            .expect("version 2 terms should extract and verify");
+
+        assert_eq!(terms.auction_version, 2);
+        assert_eq!(terms.bid_usdc, dec!(875));
+        assert_eq!(terms.auction_terms_hash, ENGINE_V2_VECTOR);
+    }
+
+    #[test]
+    fn status_terms_refuse_a_published_hash_this_crate_cannot_reproduce() {
+        let account = "0x0000000000000000000000000000000000000001";
+        let wallet = WalletAddress::from_str(account).unwrap();
+        let full = full_status(2, dec!(875), Some("sha256:not-the-local-hash"));
+
+        let error = standard_margin_bid_terms_from_status(account, &wallet, &full)
+            .expect_err("a terms hash mismatch must stop the bid");
+
+        assert!(matches!(
+            error,
+            CycleError::AuctionTerms(AuctionTermsError::TermsHashMismatch {
+                auction_version: 2,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn status_terms_refuse_unknown_auction_versions() {
+        let account = "0x0000000000000000000000000000000000000001";
+        let wallet = WalletAddress::from_str(account).unwrap();
+        let full = full_status(3, dec!(875), None);
+
+        let error = standard_margin_bid_terms_from_status(account, &wallet, &full)
+            .expect_err("an unknown version must not be hashed as a known one");
+
+        assert!(matches!(
+            error,
+            CycleError::AuctionTerms(AuctionTermsError::UnsupportedVersion { version: 3 })
+        ));
     }
 
     #[tokio::test]

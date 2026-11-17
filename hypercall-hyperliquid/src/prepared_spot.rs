@@ -18,7 +18,7 @@
 
 use hypersdk::hypercore::{
     types::{
-        Action, BatchOrder, OrderGrouping, OrderRequest, OrderTypePlacement,
+        Action, BatchOrder, Builder, OrderGrouping, OrderRequest, OrderTypePlacement,
         TimeInForce as HyperliquidTimeInForce,
     },
     Chain,
@@ -203,6 +203,44 @@ impl PreparedHyperliquidAction {
         nonce: u64,
         expires_after_ms: u64,
     ) -> Result<Self> {
+        Self::prepare_spot_order_inner(chain, order, sz_decimals, nonce, expires_after_ms, None)
+    }
+
+    /// Prepare one exact user spot order on the TEE rail: the
+    /// same `order` action as [`Self::prepare_spot_limit_order`], carrying
+    /// the Hypercall builder at zero fee for attribution, as every TEE perp
+    /// order does.
+    pub fn prepare_user_spot_order(
+        chain: Chain,
+        order: PreparedSpotLimitOrder,
+        sz_decimals: u32,
+        nonce: u64,
+        expires_after_ms: u64,
+        builder_address: crate::HyperliquidAddress,
+    ) -> Result<Self> {
+        if builder_address == crate::HyperliquidAddress::ZERO {
+            return Err(ClientError::InvalidInput(
+                "prepared Hyperliquid builder address must not be zero".to_string(),
+            ));
+        }
+        Self::prepare_spot_order_inner(
+            chain,
+            order,
+            sz_decimals,
+            nonce,
+            expires_after_ms,
+            Some(builder_address),
+        )
+    }
+
+    fn prepare_spot_order_inner(
+        chain: Chain,
+        order: PreparedSpotLimitOrder,
+        sz_decimals: u32,
+        nonce: u64,
+        expires_after_ms: u64,
+        builder_address: Option<crate::HyperliquidAddress>,
+    ) -> Result<Self> {
         let asset = order.asset()?;
         validate_spot_price(order.limit_px, sz_decimals)?;
         validate_spot_size(order.size, sz_decimals)?;
@@ -229,7 +267,10 @@ impl PreparedHyperliquidAction {
                 cloid: cloid_from_u128(order.cloid),
             }],
             grouping: OrderGrouping::Na,
-            builder: None,
+            builder: builder_address.map(|builder_address| Builder {
+                builder_address,
+                fee: 0,
+            }),
         });
         let action_digest = action_digest(&action, chain, nonce, None, expires_after_ms)?;
         let prepared = Self {
@@ -249,12 +290,56 @@ impl PreparedHyperliquidAction {
     /// Return the exact spot order encoded by the validated native action.
     /// A perp asset, a builder or a reduce-only flag is not a spot order.
     pub fn spot_limit_order(&self) -> Result<PreparedSpotLimitOrder> {
+        if self.spot_builder()?.is_some() {
+            return Err(ClientError::InvalidInput(
+                "prepared Hyperliquid spot order must not name a builder".to_string(),
+            ));
+        }
+        self.spot_order_terms()
+    }
+
+    /// Return a user spot order and its builder: the same exact
+    /// order as [`Self::spot_limit_order`], which must name a non-zero
+    /// builder at zero fee.
+    pub fn user_spot_order(&self) -> Result<(PreparedSpotLimitOrder, crate::HyperliquidAddress)> {
+        let Some(builder) = self.spot_builder()? else {
+            return Err(ClientError::InvalidInput(
+                "prepared Hyperliquid user spot order must name the builder".to_string(),
+            ));
+        };
+        if builder.fee != 0 || builder.builder_address == crate::HyperliquidAddress::ZERO {
+            return Err(ClientError::InvalidInput(
+                "prepared Hyperliquid user spot order builder must be non-zero at zero fee"
+                    .to_string(),
+            ));
+        }
+        Ok((self.spot_order_terms()?, builder.builder_address))
+    }
+
+    fn spot_builder(&self) -> Result<Option<Builder>> {
         self.validate()?;
         let Action::Order(batch) = &self.action else {
             return Err(ClientError::InvalidInput(
                 "prepared Hyperliquid action is not a spot limit order".to_string(),
             ));
         };
+        Ok(batch.builder.clone())
+    }
+
+    fn spot_order_terms(&self) -> Result<PreparedSpotLimitOrder> {
+        self.validate()?;
+        let Action::Order(batch) = &self.action else {
+            return Err(ClientError::InvalidInput(
+                "prepared Hyperliquid action is not a spot limit order".to_string(),
+            ));
+        };
+        // A batch may hold up to 100 orders; only the first would be checked
+        // against the signed terms, so any other shape is no spot order.
+        if batch.orders.len() != 1 || !matches!(batch.grouping, OrderGrouping::Na) {
+            return Err(ClientError::InvalidInput(
+                "prepared Hyperliquid spot order is not one standalone limit order".to_string(),
+            ));
+        }
         let order = &batch.orders[0];
         let asset = u32::try_from(order.asset)
             .ok()
@@ -267,11 +352,6 @@ impl PreparedHyperliquidAction {
         if order.reduce_only {
             return Err(ClientError::InvalidInput(
                 "prepared Hyperliquid spot order must not be reduce-only".to_string(),
-            ));
-        }
-        if batch.builder.is_some() {
-            return Err(ClientError::InvalidInput(
-                "prepared Hyperliquid spot order must not name a builder".to_string(),
             ));
         }
         let tif = match order.order_type {
