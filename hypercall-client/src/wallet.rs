@@ -1490,28 +1490,6 @@ impl HypercallWallet {
 
         Ok(format!("{}", signature))
     }
-
-    /// Sign a ConnectQuoteProvider action (for QP WebSocket auth).
-    pub async fn sign_connect_quote_provider(
-        &self,
-        timestamp: alloy::primitives::U256,
-        nonce: u64,
-    ) -> Result<String> {
-        let message = ConnectQuoteProvider {
-            wallet: self.address.as_wallet_address().inner(),
-            timestamp,
-            nonce,
-        };
-
-        let domain = self.hypercall_domain();
-        let signature = self
-            .signer
-            .sign_typed_data(&message, &domain)
-            .await
-            .map_err(|error| ClientError::signing("Failed to sign ConnectQuoteProvider", error))?;
-
-        Ok(format!("{}", signature))
-    }
 }
 
 impl std::fmt::Debug for HypercallWallet {
@@ -2111,6 +2089,9 @@ mod tests {
         assert_ne!(old_recovered, wallet.address.as_wallet_address().inner());
     }
 }
+
+#[path = "wallet_delegation.rs"]
+mod delegation;
 
 #[cfg(test)]
 #[path = "wallet_test.rs"]

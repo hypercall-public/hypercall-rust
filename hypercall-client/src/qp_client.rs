@@ -48,7 +48,7 @@ use tokio::time::{sleep, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
-use crate::wallet::HypercallWallet;
+use crate::wallet::{AccountAddress, HypercallWallet};
 
 pub(crate) const INBOUND_CHANNEL_CLOSED: &str = "Inbound channel closed";
 pub(crate) const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -232,6 +232,45 @@ impl QpClientConfig {
 pub async fn run_qp_client(
     config: QpClientConfig,
     wallet: Arc<HypercallWallet>,
+    outbound_rx: mpsc::Receiver<ClientOutbound>,
+    inbound_tx: mpsc::Sender<ServerInbound>,
+    callbacks: Arc<dyn QpClientCallbacks>,
+) {
+    run_qp_client_as(config, wallet, None, outbound_rx, inbound_tx, callbacks).await;
+}
+
+/// [`run_qp_client`] for a delegated session: `wallet` signs, and the session
+/// quotes as the registered `provider`.
+///
+/// `wallet` must hold RFQ authority for the provider's trading account (an
+/// active Account.sol API wallet, an unexpired engine agent, or the manager).
+/// The server re-checks that on every quote, so a revoked or expired key
+/// stops quoting at once. Firm quotes are signed by `wallet` exactly as on a
+/// direct session. A server without delegated sessions refuses the
+/// handshake, so the client keeps reconnecting without ever quoting.
+pub async fn run_qp_client_delegated(
+    config: QpClientConfig,
+    wallet: Arc<HypercallWallet>,
+    provider: AccountAddress,
+    outbound_rx: mpsc::Receiver<ClientOutbound>,
+    inbound_tx: mpsc::Sender<ServerInbound>,
+    callbacks: Arc<dyn QpClientCallbacks>,
+) {
+    run_qp_client_as(
+        config,
+        wallet,
+        Some(provider),
+        outbound_rx,
+        inbound_tx,
+        callbacks,
+    )
+    .await;
+}
+
+async fn run_qp_client_as(
+    config: QpClientConfig,
+    wallet: Arc<HypercallWallet>,
+    provider: Option<AccountAddress>,
     mut outbound_rx: mpsc::Receiver<ClientOutbound>,
     inbound_tx: mpsc::Sender<ServerInbound>,
     callbacks: Arc<dyn QpClientCallbacks>,
@@ -240,6 +279,7 @@ pub async fn run_qp_client(
         match connect_and_run(
             &config.api_url,
             &wallet,
+            provider,
             &mut outbound_rx,
             &inbound_tx,
             callbacks.as_ref(),
@@ -306,6 +346,7 @@ pub(crate) fn forward_inbound_or_close(
 pub(crate) async fn connect_and_auth(
     api_url: &str,
     wallet: &HypercallWallet,
+    provider: Option<AccountAddress>,
     callbacks: &dyn QpClientCallbacks,
 ) -> Result<(WsSink, WsStream, Vec<String>), String> {
     let ws_url = if api_url.starts_with("https") {
@@ -329,19 +370,7 @@ pub(crate) async fn connect_and_auth(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    let nonce = wallet.next_nonce();
-    let signature = wallet
-        .sign_connect_quote_provider(alloy::primitives::U256::from(now_ms), nonce)
-        .await
-        .map_err(|e| format!("Failed to sign auth: {e}"))?;
-
-    let auth_msg = ClientOutbound::ConnectQuoteProvider {
-        wallet: wallet.address.as_hex(),
-        timestamp: now_ms.to_string(),
-        nonce,
-        signature,
-    };
-    let json = serde_json::to_string(&auth_msg).map_err(|e| format!("JSON encode: {e}"))?;
+    let json = auth_frame(wallet, provider, now_ms).await?;
     match timeout(WS_WRITE_TIMEOUT, ws_sender.send(Message::Text(json))).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -403,15 +432,57 @@ pub(crate) async fn connect_and_auth(
     Ok((ws_sender, ws_receiver, capabilities))
 }
 
+/// The session's first frame, as JSON. A direct session sends
+/// `ConnectQuoteProvider` exactly as before; a delegated one sends its own
+/// `connect_delegated_quote_provider` message, signed over the provider.
+pub(crate) async fn auth_frame(
+    wallet: &HypercallWallet,
+    provider: Option<AccountAddress>,
+    now_ms: u64,
+) -> Result<String, String> {
+    let nonce = wallet.next_nonce();
+    let timestamp = alloy::primitives::U256::from(now_ms);
+    match provider {
+        None => {
+            let signature = wallet
+                .sign_connect_quote_provider(timestamp, nonce)
+                .await
+                .map_err(|e| format!("Failed to sign auth: {e}"))?;
+            let auth_msg = ClientOutbound::ConnectQuoteProvider {
+                wallet: wallet.address.as_hex(),
+                timestamp: now_ms.to_string(),
+                nonce,
+                signature,
+            };
+            serde_json::to_string(&auth_msg).map_err(|e| format!("JSON encode: {e}"))
+        }
+        Some(provider) => {
+            let signature = wallet
+                .sign_connect_delegated_quote_provider(provider, timestamp, nonce)
+                .await
+                .map_err(|e| format!("Failed to sign auth: {e}"))?;
+            let auth_msg = hypercall_ws_protocol::ConnectDelegatedQuoteProvider {
+                wallet: wallet.address.as_hex(),
+                provider: provider.as_hex(),
+                timestamp: now_ms.to_string(),
+                nonce,
+                signature,
+            };
+            serde_json::to_string(&auth_msg).map_err(|e| format!("JSON encode: {e}"))
+        }
+    }
+}
+
 async fn connect_and_run(
     api_url: &str,
     wallet: &HypercallWallet,
+    provider: Option<AccountAddress>,
     outbound_rx: &mut mpsc::Receiver<ClientOutbound>,
     inbound_tx: &mpsc::Sender<ServerInbound>,
     callbacks: &dyn QpClientCallbacks,
 ) -> Result<(), String> {
     let (mut ws_sender, mut ws_receiver, _capabilities) =
-        connect_and_auth(api_url, wallet, callbacks).await?;
+        connect_and_auth(api_url, wallet, provider, callbacks).await?;
 
     // Message loop with heartbeat timeout
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
@@ -575,6 +646,7 @@ mod tests {
             connect_and_run(
                 &format!("http://{}", addr),
                 &wallet,
+                None,
                 &mut outbound_rx,
                 &inbound_tx,
                 &callbacks,
@@ -591,5 +663,46 @@ mod tests {
             callbacks.transport_activity.load(Ordering::Relaxed) >= 3,
             "expected connect, auth, and ping/pong activity callbacks"
         );
+    }
+
+    #[tokio::test]
+    async fn the_direct_frame_is_unchanged_and_the_delegated_one_is_its_own_type() {
+        let wallet = HypercallWallet::from_private_key(TEST_PRIVATE_KEY, 998).unwrap();
+        let now_ms = 1_711_036_800_000u64;
+
+        // Direct: the exact frame the client sent before delegation existed.
+        let direct = auth_frame(&wallet, None, now_ms).await.unwrap();
+        let direct_value: serde_json::Value = serde_json::from_str(&direct).unwrap();
+        let nonce = direct_value["nonce"].as_u64().unwrap();
+        let signature = wallet
+            .sign_connect_quote_provider(alloy::primitives::U256::from(now_ms), nonce)
+            .await
+            .unwrap();
+        let before = serde_json::to_string(&ClientOutbound::ConnectQuoteProvider {
+            wallet: wallet.address.as_hex(),
+            timestamp: now_ms.to_string(),
+            nonce,
+            signature,
+        })
+        .unwrap();
+        assert_eq!(direct, before);
+
+        let provider = AccountAddress::from(hypercall_sdk_types::WalletAddress::from([0x11; 20]));
+        let delegated = auth_frame(&wallet, Some(provider), now_ms).await.unwrap();
+        let frame: hypercall_ws_protocol::ConnectDelegatedQuoteProvider =
+            serde_json::from_str(&delegated).unwrap();
+        assert_eq!(frame.wallet, wallet.address.as_hex());
+        assert_eq!(frame.provider, provider.as_hex());
+        let expected = wallet
+            .sign_connect_delegated_quote_provider(
+                provider,
+                alloy::primitives::U256::from(now_ms),
+                frame.nonce,
+            )
+            .await
+            .unwrap();
+        assert_eq!(frame.signature, expected);
+        // An old server reading it as a QP message refuses it.
+        assert!(serde_json::from_str::<ClientOutbound>(&delegated).is_err());
     }
 }

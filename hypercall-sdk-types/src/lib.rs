@@ -31,11 +31,12 @@ pub use enums::{
     QpStatus, RfqStatus, Side, TimeInForce, TradeSide, TradingModes, TransactionStatus,
 };
 pub use requests::{
-    AcceptRfqRequest, ApproveAgentRequest, BulkCancelOrderRequest, BulkPlaceOrderRequest,
-    CancelOrderByClientIdRequest, CancelOrderByCloidRequest, CancelOrderRequest, PlaceOrderRequest,
-    ReplaceOrderRequest, RevokeAgentRequest, RevokeAllAgentsRequest, RfqLegRequest,
-    SetMarginModeRequest, StandardMarginLiquidationOrderRequest,
-    StandardMarginLiquidationPositionRequest, SubmitRfqRequest,
+    AcceptRfqRequest, ApproveAgentRequest, ApproveAgentWithExpiryRequest, BulkCancelOrderRequest,
+    BulkPlaceOrderRequest, CancelOrderByClientIdRequest, CancelOrderByCloidRequest,
+    CancelOrderRequest, PlaceOrderRequest, ReplaceOrderRequest, RevokeAgentRequest,
+    RevokeAllAgentsRequest, RfqLegRequest, SetMarginModeRequest,
+    StandardMarginLiquidationOrderRequest, StandardMarginLiquidationPositionRequest,
+    SubmitRfqRequest,
 };
 pub use responses::{
     ApiResponse, ApproveAgentResponse, AuthorizedAgentsResponse, BulkCancelOrderResponse,

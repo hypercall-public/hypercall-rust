@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.5.1 (2026-11-27)
+
+Additive only: no existing public item, wire frame, request or response
+changes (`cargo semver-checks` against 0.5.0 reports no semver update
+required). `hypercall-client` 0.5.1 requires `hypercall-ws-protocol` 0.5.1,
+because it sends the new delegated handshake frame.
+
+Publish order: `hypercall-ws-protocol`, `hypercall-sdk-types`,
+`hypercall-client`. Deploy the API server first: an older server refuses a
+delegated handshake and answers `/approve-agent-with-expiry` with 404, so a
+new client fails closed against it.
+
+### Added: delegated quote-provider sessions (`hypercall-ws-protocol`, `hypercall-client`)
+
+- `hypercall-ws-protocol` adds `ConnectDelegatedQuoteProvider`, a new
+  `connect_delegated_quote_provider` frame. A short-lived key signs it for an
+  already registered `provider` under a new EIP-712 type that binds the
+  provider, `ConnectDelegatedQuoteProvider(address provider,address
+  signer,uint256 timestamp,uint64 nonce)`. The key needs no registration of
+  its own: it must hold RFQ authority for the provider's account (an active
+  `Account.sol` API wallet, the signing manager, or an unexpired engine
+  agent). Sessions, routing and indicatives stay keyed by the provider; firm
+  quotes are signed by the key, exactly as a direct provider signs today.
+- `hypercall_client::qp_client::run_qp_client_delegated` and
+  `hypercall_client::qp_scoped::run_qp_scoped_client_delegated` open such a
+  session. `run_qp_client` and `run_qp_scoped_client` are unchanged, and a
+  direct handshake is byte-identical to 0.5.0.
+- The server checks the key's authority at the handshake, on every firm
+  quote and again at execution, and re-checks a live delegated session every
+  2 s. A key that loses authority (API wallet removed, agent revoked or
+  expired, manager changed) is disconnected with close code `4403` and its
+  indicatives are evicted; a firm quote refused for signer authority
+  disconnects at once. Delegated sessions require native RFQ V1 authority.
+
+### Added: expiring agent approvals (`hypercall-sdk-types`, `hypercall-client`)
+
+- New `POST /approve-agent-with-expiry` and
+  `hypercall_sdk_types::requests::ApproveAgentWithExpiryRequest`, signed over
+  a distinct `ApproveAgentWithExpiry(address agent,uint64 expiresAtMs,uint64
+  nonce)` type so an ordinary `ApproveAgent` signature cannot be replayed
+  with another lifetime. The expiry must be 1 minute to 90 days ahead.
+  `POST /approve-agent` is unchanged and its approvals still never expire.
+- `HypercallClient::approve_agent_with_expiry` and
+  `HypercallClient::revoke_agent`. Expired agents still count toward the
+  50-agent cap per wallet until revoked, so a client that rotates keys should
+  revoke the previous one.
+
 ## 0.5.0 (unreleased)
 
 `hypercall-ws-protocol`, `hypercall-sdk-types`, `hypercall-client`,

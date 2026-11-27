@@ -6,6 +6,7 @@ description = "Direct Hyperliquid perp venue adapter for Hypercall SDK clients"
 readme = "README.md"
 license = "MIT"
 homepage = "https://github.com/hypercall-public"
+repository = "https://github.com/hypercall-public/hypercall-rust"
 documentation = "https://docs.rs/hypercall-hyperliquid"
 keywords = ["hypercall", "hyperliquid", "trading", "sdk"]
 categories = ["api-bindings"]

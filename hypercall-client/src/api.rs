@@ -65,6 +65,8 @@ const API_ROUTE_ORDER: &str = "/order";
 const API_ROUTE_BULK_ORDER: &str = "/bulk_order";
 const API_ROUTE_ORDERS: &str = "/orders";
 const API_ROUTE_MARGIN_MODE: &str = "/margin-mode";
+const API_ROUTE_APPROVE_AGENT_WITH_EXPIRY: &str = "/approve-agent-with-expiry";
+const API_ROUTE_REVOKE_AGENT: &str = "/revoke-agent";
 const API_ROUTE_LIQUIDATION_STATUS: &str = "/liquidation/status";
 const API_ROUTE_STANDARD_MARGIN_LIQUIDATION: &str = "/liquidation/standard-margin";
 const API_ROUTE_RFQ_REQUEST: &str = "/rfq/request";
@@ -1391,6 +1393,55 @@ impl HypercallClient {
         })
     }
 
+    /// Approve `agent` to sign options orders, cancels and RFQ for `owner`
+    /// until `expires_at_ms` (Unix milliseconds). The server accepts an
+    /// expiry from one minute to 90 days ahead of its clock. An expired agent
+    /// still counts toward the wallet's agent limit until revoked, so a
+    /// client that rotates agents should also [`Self::revoke_agent`] the key
+    /// it replaces.
+    pub async fn approve_agent_with_expiry(
+        &self,
+        owner: &HypercallWallet,
+        agent: AccountAddress,
+        expires_at_ms: u64,
+    ) -> Result<()> {
+        let nonce = owner.next_nonce();
+        let signature = owner
+            .sign_approve_agent_with_expiry(agent, expires_at_ms, nonce)
+            .await?;
+        let request = hypercall_sdk_types::ApproveAgentWithExpiryRequest {
+            agent: agent.into_wallet_address(),
+            expires_at_ms,
+            nonce,
+            signature,
+        };
+        let response: hypercall_sdk_types::ApproveAgentResponse = Self::send_json_body(
+            self.request(Method::POST, API_ROUTE_APPROVE_AGENT_WITH_EXPIRY),
+            &request,
+            "approve agent with expiry",
+        )
+        .await?;
+        agent_auth_outcome(response.success, response.error, "approve agent")
+    }
+
+    /// Revoke `agent`'s authorization for `owner`.
+    pub async fn revoke_agent(&self, owner: &HypercallWallet, agent: AccountAddress) -> Result<()> {
+        let nonce = owner.next_nonce();
+        let signature = owner.sign_revoke_agent(agent, nonce).await?;
+        let request = hypercall_sdk_types::RevokeAgentRequest {
+            agent: agent.into_wallet_address(),
+            nonce,
+            signature,
+        };
+        let response: hypercall_sdk_types::RevokeAgentResponse = Self::send_json_body(
+            self.request(Method::DELETE, API_ROUTE_REVOKE_AGENT),
+            &request,
+            "revoke agent",
+        )
+        .await?;
+        agent_auth_outcome(response.success, response.error, "revoke agent")
+    }
+
     /// Set margin mode for a wallet.
     pub async fn set_margin_mode(
         &self,
@@ -1785,3 +1836,19 @@ mod compression_tests;
 #[cfg(test)]
 #[path = "api_test.rs"]
 mod tests;
+
+/// Agent endpoints answer `200` with `success: false` for a refusal (bad
+/// signature, expiry out of bounds, engine rejection); surface it as an error.
+fn agent_auth_outcome(success: bool, error: Option<String>, action: &str) -> Result<()> {
+    if success {
+        Ok(())
+    } else {
+        Err(ClientError::Api {
+            status: 200,
+            message: format!(
+                "{action} refused: {}",
+                error.unwrap_or_else(|| "no reason given".to_string())
+            ),
+        })
+    }
+}
