@@ -1,11 +1,12 @@
 [package]
 name = "hypercall-ws-protocol"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Stable WebSocket protocol DTOs for Hypercall edge services"
 readme = "README.md"
 license = "MIT"
 homepage = "https://github.com/hypercall-public"
+repository = "https://github.com/hypercall-public/hypercall-rust"
 documentation = "https://docs.rs/hypercall-ws-protocol"
 keywords = ["hypercall", "websocket", "trading", "sdk"]
 categories = ["api-bindings", "web-programming::websocket"]

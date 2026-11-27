@@ -6,6 +6,7 @@ description = "Public proof-of-concept standard margin liquidator with external 
 readme = "README.md"
 license = "MIT"
 homepage = "https://github.com/hypercall-public"
+repository = "https://github.com/hypercall-public/hypercall-rust"
 documentation = "https://docs.rs/hypercall-liquidator"
 keywords = ["hypercall", "liquidation", "trading", "sdk"]
 categories = ["command-line-utilities"]

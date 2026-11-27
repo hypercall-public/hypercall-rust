@@ -1,11 +1,12 @@
 [package]
 name = "hypercall-client"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Client library for interacting with Hypercall trading platform"
 readme = "README.md"
 license = "MIT"
 homepage = "https://github.com/hypercall-public"
+repository = "https://github.com/hypercall-public/hypercall-rust"
 documentation = "https://docs.rs/hypercall-client"
 keywords = ["hypercall", "trading", "options", "sdk"]
 categories = ["api-bindings", "web-programming::websocket"]
@@ -37,8 +38,8 @@ displaystr = "0.1.16"
 thiserror = "1"
 rust_decimal = { version = "1.39", features = ["serde-with-str"] }
 # Shared types
-hypercall-sdk-types = { path = "../hypercall-sdk-types", version = "0.5.0" }
-hypercall-ws-protocol = { path = "../hypercall-ws-protocol", version = "0.5.0" }
+hypercall-sdk-types = { path = "../hypercall-sdk-types", version = "0.5.1" }
+hypercall-ws-protocol = { path = "../hypercall-ws-protocol", version = "0.5.1" }
 
 # Alloy for signing and wallet operations
 alloy = { version = "1.0", default-features = false, features = ["contract", "provider-http", "network", "signer-local", "eip712", "reqwest"] }
@@ -87,7 +88,7 @@ uuid = { version = "1", features = ["v7"] }
 [dev-dependencies]
 # RequestPacket and ResponsePacket are used only by crate-private HTTP fixtures.
 alloy = { version = "1.0", default-features = false, features = ["json-rpc"] }
-hypercall-sdk-types = { path = "../hypercall-sdk-types", version = "0.5.0", features = ["test-utils"] }
+hypercall-sdk-types = { path = "../hypercall-sdk-types", version = "0.5.1", features = ["test-utils"] }
 tokio = { version = "1", features = ["full"] }
 rust_decimal_macros = "1.35"
 proptest = "1.0"

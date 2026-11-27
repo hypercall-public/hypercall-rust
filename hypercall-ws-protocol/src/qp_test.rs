@@ -1,6 +1,7 @@
 use super::{
-    BorrowedIndicativeQuoteUpdate, BorrowedScopedIndicativeQuoteUpdate, IndicativeQuote,
-    QpClientMessage, QpPhysicalLeg, QpRfqLeg, QpServerMessage, ScopeId, CAP_SCOPED_INDICATIVE,
+    BorrowedIndicativeQuoteUpdate, BorrowedScopedIndicativeQuoteUpdate,
+    ConnectDelegatedQuoteProvider, IndicativeQuote, QpClientMessage, QpPhysicalLeg, QpRfqLeg,
+    QpServerMessage, ScopeId, CAP_SCOPED_INDICATIVE,
 };
 use std::borrow::Cow;
 
@@ -294,4 +295,29 @@ fn an_rfq_leg_from_an_older_server_decodes_without_physical_terms() {
         serde_json::from_str(r#"{"instrument":"UBTC-20260501-90000-C","side":"buy","size":"1"}"#)
             .unwrap();
     assert_eq!(leg.physical, None);
+}
+
+#[test]
+fn delegated_connect_is_its_own_message_type() {
+    let msg = ConnectDelegatedQuoteProvider {
+        wallet: "0x123".to_string(),
+        provider: "0x456".to_string(),
+        timestamp: "42".to_string(),
+        nonce: 7,
+        signature: "0xsig".to_string(),
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    assert_eq!(
+        json,
+        r#"{"type":"connect_delegated_quote_provider","wallet":"0x123","provider":"0x456","timestamp":"42","nonce":7,"signature":"0xsig"}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<ConnectDelegatedQuoteProvider>(&json).unwrap(),
+        msg
+    );
+    // A server that only knows `QpClientMessage` refuses it outright.
+    assert!(serde_json::from_str::<QpClientMessage>(&json).is_err());
+    // And a direct handshake is never read as a delegated one.
+    let direct = r#"{"type":"connect_quote_provider","wallet":"0x123","timestamp":"42","nonce":7,"signature":"0xsig"}"#;
+    assert!(serde_json::from_str::<ConnectDelegatedQuoteProvider>(direct).is_err());
 }

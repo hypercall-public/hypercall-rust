@@ -11,9 +11,9 @@ pub use channel::{WsChannel, RETIRED_CHANNELS, UNKNOWN_CHANNEL_CODE};
 pub use client::{ClientControlMessage, GatewayErrorCode, GatewayStatus, GatewayStatusMessage};
 pub use qp::{
     BorrowedIndicativeQuote, BorrowedIndicativeQuoteUpdate, BorrowedScopedIndicativeQuoteUpdate,
-    GatewayResumeQuoteProvider, IndicativeQuote, QpClientMessage, QpInboundMessage,
-    QpOutboundMessage, QpPhysicalLeg, QpResponseLeg, QpRfqLeg, QpServerMessage, ScopeId,
-    ScopeIdParseError, CAP_SCOPED_INDICATIVE,
+    ConnectDelegatedQuoteProvider, GatewayResumeQuoteProvider, IndicativeQuote, QpClientMessage,
+    QpInboundMessage, QpOutboundMessage, QpPhysicalLeg, QpResponseLeg, QpRfqLeg, QpServerMessage,
+    ScopeId, ScopeIdParseError, CAP_SCOPED_INDICATIVE,
 };
 pub use recovery::{
     WsCloseError, WsDeliveryClass, WsPressureCause, WsRecoveryAction, WsSlowConsumerCloseReason,

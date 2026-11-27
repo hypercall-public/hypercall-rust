@@ -23,9 +23,9 @@ fn hash(version: u64, bid: Decimal, valuation_ms: u64) -> Result<String, Auction
     )
 }
 
-/// The terms hash exactly as published hypercall-liquidator 0.4.0 computed
-/// it: the bid is hashed for every version.
-fn hash_0_4_0(version: u64, bid: Decimal, valuation_ms: u64) -> String {
+/// A terms hash that includes the bid whatever the version (the version 1
+/// rule applied to every version).
+fn hash_with_bid(version: u64, bid: Decimal, valuation_ms: u64) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -55,14 +55,14 @@ fn engine_minimum(equity: Decimal, floor_bps: u32, decay_ms: u64, elapsed_ms: u6
 }
 
 #[test]
-fn published_0_4_0_hash_fails_version_2_terms() {
-    // Root cause: 0.4.0 hashes the bid into version 2 terms, so it never
-    // reproduces the engine's version 2 hash and settlement rejects the bid.
+fn a_bid_inclusive_hash_never_matches_version_2_terms() {
+    // Version 2 terms leave the bid out, so hashing it in never reproduces
+    // the engine's version 2 hash, and settlement would reject the bid.
     for bid in [dec!(75), dec!(750), dec!(1000)] {
-        assert_ne!(hash_0_4_0(2, bid, VALUATION_MS), ENGINE_V2_VECTOR);
+        assert_ne!(hash_with_bid(2, bid, VALUATION_MS), ENGINE_V2_VECTOR);
     }
     // The verifier names the failure before a bid is ever signed.
-    let stale = hash_0_4_0(2, dec!(75), VALUATION_MS);
+    let stale = hash_with_bid(2, dec!(75), VALUATION_MS);
     assert!(matches!(
         verify_published_terms_hash(2, &stale, Some(ENGINE_V2_VECTOR)),
         Err(AuctionTermsError::TermsHashMismatch {
@@ -86,7 +86,7 @@ fn version_1_hash_is_unchanged_from_0_4_0_and_binds_the_bid() {
     for bid in [dec!(1000), dec!(1100.00), dec!(0)] {
         assert_eq!(
             hash(1, bid, VALUATION_MS).unwrap(),
-            hash_0_4_0(1, bid, VALUATION_MS)
+            hash_with_bid(1, bid, VALUATION_MS)
         );
     }
     assert_ne!(

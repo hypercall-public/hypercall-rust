@@ -117,6 +117,27 @@ pub struct GatewayResumeQuoteProvider {
     pub signature: String,
 }
 
+/// First frame of a delegated quote-provider session, sent instead of
+/// [`QpClientMessage::ConnectQuoteProvider`].
+///
+/// `wallet` is the signing key and `provider` the registered quote provider
+/// the session quotes as. The key signs `ConnectDelegatedQuoteProvider`
+/// (`provider`, `signer`, `timestamp`, `nonce`) and every firm quote of the
+/// session; the server admits it while the key holds RFQ authority for the
+/// provider's trading account. It is its own message type (`"type":
+/// "connect_delegated_quote_provider"`), so [`QpClientMessage`] and the direct
+/// handshake are unchanged, and a server without delegated sessions refuses
+/// it as an unknown first frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename = "connect_delegated_quote_provider")]
+pub struct ConnectDelegatedQuoteProvider {
+    pub wallet: String,
+    pub provider: String,
+    pub timestamp: String,
+    pub nonce: u64,
+    pub signature: String,
+}
+
 /// Messages sent by a QP client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

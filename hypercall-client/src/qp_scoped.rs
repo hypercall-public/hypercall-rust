@@ -398,6 +398,40 @@ async fn next_outbound(
 pub async fn run_qp_scoped_client(
     config: QpClientConfig,
     wallet: Arc<crate::wallet::HypercallWallet>,
+    runtime: QpScopedRuntime,
+    inbound_tx: mpsc::Sender<ServerInbound>,
+    callbacks: Arc<dyn QpClientCallbacks>,
+) {
+    run_qp_scoped_client_as(config, wallet, None, runtime, inbound_tx, callbacks).await;
+}
+
+/// [`run_qp_scoped_client`] for a delegated session: `wallet` signs, and the
+/// session quotes as the registered `provider`. See
+/// [`crate::qp_client::run_qp_client_delegated`] for the authority `wallet`
+/// needs.
+pub async fn run_qp_scoped_client_delegated(
+    config: QpClientConfig,
+    wallet: Arc<crate::wallet::HypercallWallet>,
+    provider: crate::wallet::AccountAddress,
+    runtime: QpScopedRuntime,
+    inbound_tx: mpsc::Sender<ServerInbound>,
+    callbacks: Arc<dyn QpClientCallbacks>,
+) {
+    run_qp_scoped_client_as(
+        config,
+        wallet,
+        Some(provider),
+        runtime,
+        inbound_tx,
+        callbacks,
+    )
+    .await;
+}
+
+async fn run_qp_scoped_client_as(
+    config: QpClientConfig,
+    wallet: Arc<crate::wallet::HypercallWallet>,
+    provider: Option<crate::wallet::AccountAddress>,
     mut runtime: QpScopedRuntime,
     inbound_tx: mpsc::Sender<ServerInbound>,
     callbacks: Arc<dyn QpClientCallbacks>,
@@ -406,6 +440,7 @@ pub async fn run_qp_scoped_client(
         let result = connect_and_run_scoped(
             &config,
             &wallet,
+            provider,
             &mut runtime,
             &inbound_tx,
             callbacks.as_ref(),
@@ -451,12 +486,13 @@ pub async fn run_qp_scoped_client(
 async fn connect_and_run_scoped(
     config: &QpClientConfig,
     wallet: &crate::wallet::HypercallWallet,
+    provider: Option<crate::wallet::AccountAddress>,
     runtime: &mut QpScopedRuntime,
     inbound_tx: &mpsc::Sender<ServerInbound>,
     callbacks: &dyn QpClientCallbacks,
 ) -> Result<(), String> {
     let (mut ws_sender, mut ws_receiver, capabilities) =
-        connect_and_auth(&config.api_url, wallet, callbacks).await?;
+        connect_and_auth(&config.api_url, wallet, provider, callbacks).await?;
     let scoped_supported = capabilities.iter().any(|c| c == CAP_SCOPED_INDICATIVE);
     if !scoped_supported {
         info!("Server did not advertise {CAP_SCOPED_INDICATIVE}; using full-snapshot fallback");

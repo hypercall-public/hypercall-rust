@@ -95,6 +95,20 @@ pub struct ApproveAgentRequest {
     pub signature: String,
 }
 
+/// Request to approve an agent wallet whose authorization lapses at
+/// `expires_at_ms`. Signed as `ApproveAgentWithExpiry`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApproveAgentWithExpiryRequest {
+    /// Agent wallet address to authorize
+    pub agent: WalletAddress,
+    /// Unix milliseconds after which the agent no longer signs for the wallet
+    pub expires_at_ms: u64,
+    /// Nonce for replay protection
+    pub nonce: u64,
+    /// EIP-712 signature from wallet owner
+    pub signature: String,
+}
+
 /// Request to revoke an agent wallet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevokeAgentRequest {
